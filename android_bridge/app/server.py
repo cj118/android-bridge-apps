@@ -23,6 +23,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import adbctl
+import control as control_actions
 import pngcheck
 
 VERSION = "0.2.2"
@@ -52,8 +53,8 @@ MCP_ALLOWED_HOSTS = (
     "f5588468-ha-opencode-beta",
 )
 MCP_ALLOWLIST_TTL_SECONDS = 30.0
-VIEWING_WINDOW_DEFAULT_MINUTES = 10
-VIEWING_WINDOW_MAX_MINUTES = 30
+UI_SESSION_TTL_SECONDS = 8 * 3600
+ACTION_SETTLE_SECONDS = 0.6
 _ALLOWLIST = {"ips": frozenset(), "at": 0.0}
 
 
@@ -101,6 +102,19 @@ _PAIR_PAGE = (
     "<p><label>6-digit pairing code<br><input name='code' size='8'></label></p>"
     "<p><label>Connect port<br><input name='connect_port' size='8'></label></p>"
     "<p><button type='submit'>Pair and connect</button></p>"
+    "</form></body></html>"
+).encode("utf-8")
+
+
+_CONTROL_LOGIN = (
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<title>Android Bridge - control sign in</title></head>"
+    "<body style='font-family:system-ui;max-width:30rem;margin:3rem auto'>"
+    "<h1>Control sign in</h1>"
+    "<p>Enter the bridge bearer token. It is never stored in the page.</p>"
+    "<form method='post' action='control'>"
+    "<p><input name='token' type='password' size='46'></p>"
+    "<p><button type='submit'>Sign in</button></p>"
     "</form></body></html>"
 ).encode("utf-8")
 
@@ -319,6 +333,7 @@ class Handler(BaseHTTPRequestHandler):
         "/disconnect": "disconnect",
         "/mcp": "mcp",
         "/window": "window",
+        "/control": "control",
     }
 
     def _send_json(self, code, payload, extra_headers=None):
@@ -404,8 +419,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._authorized(), "unauthorized"
         if not mcp_source_allowed(self.client_address[0]):
             return False, "unauthorized"
-        if self.server.viewing_window_until <= time.monotonic():
-            return False, "viewing_window_closed"
+        if not self.server.viewing_active:
+            return False, "viewing_session_closed"
         return True, None
 
     def _require_auth(self, form_token=None) -> bool:
@@ -457,6 +472,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/pair":
             self._send_html(_PAIR_PAGE)
+            return
+
+        if path == "/control":
+            nonce = self._ui_session()
+            if not nonce:
+                self._send_html(_CONTROL_LOGIN)
+                return
+            self._send_html(self._control_page(nonce))
             return
 
         if path == "/status":
@@ -524,6 +547,7 @@ class Handler(BaseHTTPRequestHandler):
                 return None, "device_not_paired"
             _info, device = self._resolve_device()
             if device is None:
+                self._end_sessions()
                 return None, "device_not_connected"
 
             try:
@@ -573,6 +597,58 @@ class Handler(BaseHTTPRequestHandler):
             "inputSchema": {
                 "type": "object",
                 "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "android_tap",
+            "description": (
+                "Propose a tap. It does not execute: a human must approve it in "
+                "the bridge Control page. Poll android_action_result afterwards."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "integer", "minimum": 0, "maximum": 4095},
+                    "y": {"type": "integer", "minimum": 0, "maximum": 4095},
+                },
+                "required": ["x", "y"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "android_swipe",
+            "description": "Propose a swipe. Requires human approval in the bridge Control page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x1": {"type": "integer", "minimum": 0, "maximum": 4095},
+                    "y1": {"type": "integer", "minimum": 0, "maximum": 4095},
+                    "x2": {"type": "integer", "minimum": 0, "maximum": 4095},
+                    "y2": {"type": "integer", "minimum": 0, "maximum": 4095},
+                    "duration_ms": {"type": "integer", "minimum": 50, "maximum": 5000},
+                },
+                "required": ["x1", "y1", "x2", "y2"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "android_text",
+            "description": "Propose typing text. Requires human approval in the bridge Control page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string", "maxLength": 200}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "android_action_result",
+            "description": "Poll a proposed action by id; returns state and the post-action screenshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string", "maxLength": 32}},
+                "required": ["id"],
                 "additionalProperties": False,
             },
         },
@@ -671,10 +747,113 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"jsonrpc": "2.0", "id": message_id, "result": result})
             return
 
+        if name in ("android_tap", "android_swipe", "android_text"):
+            self._mcp_propose(name, params, message_id)
+            return
+
+        if name == "android_action_result":
+            self._mcp_action_result(params, message_id)
+            return
+
         self._send_json(
             200,
             {"jsonrpc": "2.0", "id": message_id,
              "error": {"code": -32602, "message": "unknown tool"}},
+        )
+
+    def _mcp_error(self, message_id, text):
+        self._send_json(
+            200,
+            {"jsonrpc": "2.0", "id": message_id,
+             "result": {"content": [{"type": "text", "text": text}], "isError": True}},
+        )
+
+    def _mcp_propose(self, name, params, message_id):
+        if not self.server.control_active:
+            self._mcp_error(message_id, "control_session_inactive")
+            return
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        try:
+            if name == "android_tap":
+                action = control_actions.validate_tap(arguments.get("x"), arguments.get("y"))
+            elif name == "android_swipe":
+                action = control_actions.validate_swipe(
+                    arguments.get("x1"), arguments.get("y1"),
+                    arguments.get("x2"), arguments.get("y2"),
+                    arguments.get("duration_ms", 300),
+                )
+            else:
+                action = control_actions.validate_text(arguments.get("text"))
+        except control_actions.ActionError as exc:
+            self._mcp_error(message_id, str(exc))
+            return
+
+        _info, device = self._resolve_device()
+        if device is None:
+            self._end_sessions()
+            self._mcp_error(message_id, "device_not_connected")
+            return
+
+        try:
+            preshot = adbctl.screencap(device["serial"], timeout=20.0)
+            pngcheck.validate(preshot, max_bytes=MAX_CAPTURE_BYTES)
+        except (adbctl.AdbError, pngcheck.PngError):
+            self._mcp_error(message_id, "capture_failed")
+            return
+
+        try:
+            record = self.server.approvals.create(action, device["serial"], preshot)
+        except control_actions.ActionError as exc:
+            self._mcp_error(message_id, str(exc))
+            return
+
+        summary = {
+            "approval_id": record["id"],
+            "state": "pending",
+            "action": control_actions.describe(action),
+            "device": device["serial"],
+            "expires_in_seconds": int(control_actions.APPROVAL_TTL_SECONDS),
+            "next": "await human approval in the Control page, then call android_action_result",
+        }
+        content = [
+            {"type": "text", "text": json.dumps(summary)},
+            {"type": "image", "data": base64.b64encode(preshot).decode("ascii"),
+             "mimeType": "image/png"},
+        ]
+        self._send_json(
+            200,
+            {"jsonrpc": "2.0", "id": message_id,
+             "result": {"content": content, "isError": False}},
+        )
+
+    def _mcp_action_result(self, params, message_id):
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        key = str(arguments.get("id") or "")
+        record = self.server.approvals.get(key)
+        if record is None:
+            self._mcp_error(message_id, "unknown_approval")
+            return
+        payload = {
+            "id": key,
+            "state": record["state"],
+            "action": control_actions.describe(record["action"]),
+            "detail": record.get("detail", ""),
+        }
+        content = [{"type": "text", "text": json.dumps(payload)}]
+        if record.get("postshot"):
+            content.append(
+                {"type": "image",
+                 "data": base64.b64encode(record["postshot"]).decode("ascii"),
+                 "mimeType": "image/png"}
+            )
+        self._send_json(
+            200,
+            {"jsonrpc": "2.0", "id": message_id,
+             "result": {"content": content, "isError": False}},
         )
 
     # ---------- POST ----------
@@ -718,7 +897,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._handle_mcp(body)
             return
-        if path not in ("/pair", "/connect", "/disconnect", "/window"):
+        if path not in (
+            "/pair", "/connect", "/disconnect", "/window",
+            "/control", "/control/session", "/control/approve",
+            "/control/reject", "/control/stop",
+        ):
             self.close_connection = True
             self._send_json(405, {"error": "method_not_allowed"}, {"Allow": "GET"})
             return
@@ -731,6 +914,38 @@ class Handler(BaseHTTPRequestHandler):
             fields = {key: values[0] for key, values in parsed.items() if values}
         except ValueError:
             fields = {}
+
+        if path == "/control":
+            self._do_login(fields)
+            return
+        if path.startswith("/control/"):
+            nonce = self._ui_session()
+            csrf = fields.get("csrf")
+
+            if path == "/control/stop":
+                # Emergency stop: a valid CSRF-bound session, or the bearer token.
+                if nonce and self._ui_csrf_ok(nonce, csrf) and self._origin_ok():
+                    self._do_stop()
+                    return
+                if self._authorized(fields.get("token")):
+                    self._do_stop()
+                    return
+                time.sleep(AUTH_FAIL_DELAY_SECONDS)
+                self._send_json(403, {"error": "forbidden"})
+                return
+
+            if not nonce or not self._ui_csrf_ok(nonce, csrf) or not self._origin_ok():
+                time.sleep(AUTH_FAIL_DELAY_SECONDS)
+                self._send_json(403, {"error": "forbidden"})
+                return
+
+            if path == "/control/session":
+                self._do_session(fields)
+            elif path == "/control/approve":
+                self._do_approve(fields)
+            else:
+                self._do_reject(fields)
+            return
 
         if not self._require_auth(fields.get("token")):
             return
@@ -746,22 +961,239 @@ class Handler(BaseHTTPRequestHandler):
             self._do_disconnect()
 
     def _do_window(self, fields):
-        raw = (fields.get("minutes") or "").strip()
+        """Start or stop the viewing session. No fixed duration."""
+        action = (fields.get("action") or "").strip().lower()
+        minutes = (fields.get("minutes") or "").strip()
+        stop = action == "stop" or minutes == "0"
+        self.server.viewing_active = not stop
+        self._send_json(200, {"viewing": "active" if self.server.viewing_active else "stopped"})
+
+    # ---------- human control surface ----------
+
+    def _ui_session(self):
+        """Return the validated UI session nonce, or None."""
+        header = self.headers.get("Cookie", "")
+        for part in header.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name != "ab_ui" or not value:
+                continue
+            nonce, _, signature = value.partition(".")
+            if not nonce or not signature:
+                return None
+            expected = hmac.new(
+                self.server.token, nonce.encode("ascii", "ignore"), "sha256"
+            ).hexdigest()
+            if not hmac.compare_digest(expected, signature):
+                return None
+            session = self.server.ui_sessions.get(nonce)
+            if not session or session["expires"] <= time.monotonic():
+                return None
+            return nonce
+        return None
+
+    def _ui_csrf_ok(self, nonce, provided):
+        session = self.server.ui_sessions.get(nonce) or {}
+        if not provided or not session.get("csrf"):
+            return False
+        return hmac.compare_digest(session["csrf"], provided)
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        if not origin:
+            return False
+        host = self.headers.get("Host", "")
+        return urllib.parse.urlparse(origin).netloc == host and bool(host)
+
+    def _send_html_with(self, body, headers=None):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _do_login(self, fields):
+        if not self._require_auth(fields.get("token")):
+            return
+        nonce = secrets.token_hex(16)
+        csrf = hmac.new(
+            self.server.token, (nonce + ":csrf").encode("ascii"), "sha256"
+        ).hexdigest()[:32]
+        self.server.ui_sessions[nonce] = {
+            "expires": time.monotonic() + UI_SESSION_TTL_SECONDS,
+            "csrf": csrf,
+        }
+        signature = hmac.new(
+            self.server.token, nonce.encode("ascii"), "sha256"
+        ).hexdigest()
+        prefix = self.headers.get("X-Ingress-Path", "").rstrip("/") or ""
+        cookie = "ab_ui=%s.%s; Path=%s/; HttpOnly; SameSite=Strict; Max-Age=%d" % (
+            nonce,
+            signature,
+            prefix,
+            int(UI_SESSION_TTL_SECONDS),
+        )
+        body = (
+            "<html><body style='font-family:system-ui;margin:2rem'>"
+            "<p>Signed in.</p><p><a href='control'>Open control</a></p>"
+            "</body></html>"
+        ).encode("utf-8")
+        self._send_html_with(body, {"Set-Cookie": cookie})
+
+    def _do_session(self, fields):
+        view = (fields.get("view") or "").strip().lower()
+        ctl = (fields.get("control") or "").strip().lower()
+        with self.server.control_lock:
+            if view in ("on", "off"):
+                self.server.viewing_active = view == "on"
+            if ctl in ("on", "off"):
+                self.server.control_active = ctl == "on"
+                if ctl == "off":
+                    self.server.approvals.clear()
+        self._send_json(
+            200,
+            {
+                "viewing": self.server.viewing_active,
+                "control": self.server.control_active,
+            },
+        )
+
+    def _do_stop(self):
+        with self.server.control_lock:
+            self.server.control_active = False
+            self.server.approvals.clear()
+        self._send_json(200, {"control": False, "pending": 0})
+
+    def _end_sessions(self):
+        with self.server.control_lock:
+            self.server.viewing_active = False
+            self.server.control_active = False
+            self.server.approvals.clear()
+
+    def _do_approve(self, fields):
+        key = (fields.get("id") or "").strip()
+        with self.server.control_lock:
+            if not self.server.control_active:
+                self._send_json(409, {"error": "control_inactive"})
+                return
+            try:
+                record = self.server.approvals.approve(key)
+            except control_actions.ActionError as exc:
+                self._send_json(409, {"error": str(exc)})
+                return
+            if record["expires"] <= time.monotonic():
+                self.server.approvals.fail(key, "expired")
+                self._send_json(409, {"error": "approval expired"})
+                return
+            if (
+                control_actions.fingerprint(
+                    record["action"], record["device"], record["preshot"]
+                )
+                != record["fingerprint"]
+            ):
+                self.server.approvals.fail(key, "binding_mismatch")
+                self._send_json(409, {"error": "binding mismatch"})
+                return
+            _info, device = self._resolve_device()
+            if device is None:
+                self.server.approvals.fail(key, "device_unavailable")
+                self._end_sessions()
+                self._send_json(409, {"error": "device_unavailable"})
+                return
+            if device["serial"] != record["device"]:
+                self.server.approvals.fail(key, "device_mismatch")
+                self._send_json(409, {"error": "device mismatch"})
+                return
+            try:
+                adbctl.run_input(
+                    control_actions.adb_args(record["action"], device["serial"])
+                )
+            except adbctl.AdbError:
+                self.server.approvals.fail(key, "action_failed")
+                self._send_json(502, {"error": "action_failed"})
+                return
+
+        time.sleep(ACTION_SETTLE_SECONDS)
         try:
-            minutes = int(raw) if raw else VIEWING_WINDOW_DEFAULT_MINUTES
-        except ValueError:
-            self._send_json(400, {"error": "invalid_minutes"})
+            shot = adbctl.screencap(device["serial"], timeout=20.0)
+            pngcheck.validate(shot, max_bytes=MAX_CAPTURE_BYTES)
+        except (adbctl.AdbError, pngcheck.PngError):
+            self.server.approvals.complete(key, None, "executed_no_shot")
+            self._send_json(200, {"status": "executed", "screenshot": "unavailable"})
             return
-        if minutes < 0:
-            self._send_json(400, {"error": "invalid_minutes"})
+        self.server.approvals.complete(key, shot)
+        self._send_json(200, {"status": "executed"})
+
+    def _do_reject(self, fields):
+        key = (fields.get("id") or "").strip()
+        try:
+            self.server.approvals.reject(key)
+        except control_actions.ActionError as exc:
+            self._send_json(409, {"error": str(exc)})
             return
-        minutes = min(minutes, VIEWING_WINDOW_MAX_MINUTES)
-        if minutes == 0:
-            self.server.viewing_window_until = 0.0
-            self._send_json(200, {"window": "closed"})
-            return
-        self.server.viewing_window_until = time.monotonic() + minutes * 60
-        self._send_json(200, {"window": "open", "minutes": minutes})
+        self._send_json(200, {"status": "rejected"})
+
+    def _control_page(self, nonce):
+        session = self.server.ui_sessions.get(nonce) or {}
+        csrf = session.get("csrf", "")
+        pending = self.server.approvals.pending()
+        cards = []
+        for record in pending:
+            image = base64.b64encode(record["preshot"]).decode("ascii")
+            remaining = max(0, int(record["expires"] - time.monotonic()))
+            cards.append(
+                "<div style='border:1px solid #555;padding:1rem;margin:1rem 0'>"
+                "<h3>%s</h3><p>Device %s &middot; id %s &middot; expires in %ds</p>"
+                "<img src='data:image/png;base64,%s' style='max-width:100%%'>"
+                "<form method='post' action='control/approve' style='display:inline'>"
+                "<input type='hidden' name='csrf' value='%s'>"
+                "<input type='hidden' name='id' value='%s'><button>Approve</button></form> "
+                "<form method='post' action='control/reject' style='display:inline'>"
+                "<input type='hidden' name='csrf' value='%s'>"
+                "<input type='hidden' name='id' value='%s'><button>Reject</button></form>"
+                "</div>"
+                % (
+                    control_actions.describe(record["action"]),
+                    record["device"],
+                    record["id"],
+                    remaining,
+                    image,
+                    csrf,
+                    record["id"],
+                    csrf,
+                    record["id"],
+                )
+            )
+        viewing = "ON" if self.server.viewing_active else "off"
+        control = "ON" if self.server.control_active else "off"
+        body = (
+            "<html><body style='font-family:system-ui;max-width:60rem;margin:2rem auto'>"
+            "<h1>Android Bridge control</h1>"
+            "<p>Viewing session: <b>%s</b> &middot; Control session: <b>%s</b></p>"
+            "<form method='post' action='control/session'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<button name='view' value='%s'>Viewing %s</button> "
+            "<button name='control' value='%s'>Control %s</button></form>"
+            "<form method='post' action='control/stop' style='margin-top:1rem'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<button style='background:#a00;color:#fff;padding:.6rem 2rem'>STOP</button>"
+            "</form><h2>Pending approvals</h2>%s</body></html>"
+            % (
+                viewing,
+                control,
+                csrf,
+                "off" if self.server.viewing_active else "on",
+                "ON" if self.server.viewing_active else "start",
+                "off" if self.server.control_active else "on",
+                "ON" if self.server.control_active else "start",
+                csrf,
+                "".join(cards) or "<p>None.</p>",
+            )
+        )
+        return body.encode("utf-8")
 
     def _do_pair(self, fields):
         host = (fields.get("host") or "").strip()
@@ -797,6 +1229,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"status": "connected"})
 
     def _do_disconnect(self):
+        self._end_sessions()
         try:
             for device in adbctl.list_devices():
                 adbctl.disconnect(device["serial"])
@@ -856,7 +1289,11 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.data_dir = data_dir
     server.capture_lock = threading.Lock()
     server.capture_times = []
-    server.viewing_window_until = 0.0
+    server.viewing_active = False
+    server.control_active = False
+    server.ui_sessions = {}
+    server.control_lock = threading.Lock()
+    server.approvals = control_actions.Approvals()
     server.started_monotonic = time.monotonic()
     return server
 

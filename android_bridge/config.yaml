@@ -1,7 +1,7 @@
 name: "Android Bridge (b5)"
-version: "0.2.2"
+version: "0.3.0"
 slug: android_bridge
-description: "Read-only Android screen bridge (wireless ADB, no input)"
+description: "Android screen bridge: read-only viewing, approval-gated input"
 arch:
   - amd64
 startup: application

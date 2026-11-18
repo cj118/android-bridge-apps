@@ -136,3 +136,17 @@ def screencap(serial: str, timeout: float = DEFAULT_TIMEOUT):
     if not out:
         raise AdbError("empty capture")
     return out
+
+
+def run_input(args, timeout: float = 15.0):
+    """Execute a fixed input command. Only tap/swipe/text shapes are accepted."""
+    args = list(args)
+    if (
+        len(args) < 6
+        or args[2:4] != ["shell", "input"]
+        or args[4] not in ("tap", "swipe", "text")
+    ):
+        raise AdbError("rejected input command")
+    returncode, _out = _run(args, timeout=timeout, max_bytes=65536)
+    if returncode != 0:
+        raise AdbError("input failed")

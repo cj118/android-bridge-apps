@@ -111,7 +111,7 @@ class ScreenshotTests(unittest.TestCase):
 
     def setUp(self):
         self.server.capture_times.clear()
-        self.server.viewing_window_until = 0.0
+        self.server.viewing_active = False
         os.environ["FAKE_ADB_MODE"] = "ok"
 
     def auth(self):
@@ -282,7 +282,7 @@ class ScreenshotTests(unittest.TestCase):
         status, payload = self.mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in payload["result"]["tools"])
-        self.assertEqual(names, ["android_screenshot", "android_status"])
+        self.assertEqual(names, ["android_action_result", "android_screenshot", "android_status", "android_swipe", "android_tap", "android_text"])
 
     def test_mcp_screenshot_returns_image_content(self):
         status, payload = self.mcp(
@@ -325,12 +325,20 @@ class ScreenshotTests(unittest.TestCase):
         bridge._resolve_host_ips = original
         bridge.refresh_mcp_allowlist(force=True)
 
-    def _open_window(self, minutes="5"):
+    def _open_window(self):
         return self.request(
             "POST", "/window",
             {"Content-Type": "application/x-www-form-urlencoded",
              "Authorization": "Bearer " + self.token},
-            urllib.parse.urlencode({"minutes": minutes}).encode(),
+            b"action=on",
+        )
+
+    def _close_window(self):
+        return self.request(
+            "POST", "/window",
+            {"Content-Type": "application/x-www-form-urlencoded",
+             "Authorization": "Bearer " + self.token},
+            b"action=stop",
         )
 
     def test_mcp_allows_allowlisted_source_without_token(self):
@@ -344,7 +352,7 @@ class ScreenshotTests(unittest.TestCase):
             self._restore_allowlist(original)
         self.assertEqual(status, 200)
         names = sorted(t["name"] for t in payload["result"]["tools"])
-        self.assertEqual(names, ["android_screenshot", "android_status"])
+        self.assertEqual(names, ["android_action_result", "android_screenshot", "android_status", "android_swipe", "android_tap", "android_text"])
 
     def test_mcp_rejects_unknown_source_without_token(self):
         original = self._with_allowlist(set())
@@ -383,12 +391,13 @@ class ScreenshotTests(unittest.TestCase):
         finally:
             self._restore_allowlist(original)
         self.assertEqual(status, 403)
-        self.assertIn(b"viewing_window_closed", body)
+        self.assertIn(b"viewing_session_closed", body)
 
-    def test_mcp_expired_window_is_403(self):
+    def test_mcp_stopped_session_is_403(self):
         original = self._with_allowlist({"127.0.0.1"})
-        self.server.viewing_window_until = time.monotonic() - 1.0
         try:
+            self._open_window()
+            self._close_window()
             status, _, _ = self.request(
                 "POST", "/mcp",
                 {"Content-Type": "application/json"},
@@ -405,15 +414,15 @@ class ScreenshotTests(unittest.TestCase):
             b"minutes=5",
         )
         self.assertEqual(status, 401)
-        self.assertEqual(self.server.viewing_window_until, 0.0)
+        self.assertFalse(self.server.viewing_active)
 
     def test_window_opens_and_closes(self):
-        status, _, _ = self._open_window("5")
+        status, _, _ = self._open_window()
         self.assertEqual(status, 200)
-        self.assertGreater(self.server.viewing_window_until, time.monotonic())
-        status, _, _ = self._open_window("0")
+        self.assertTrue(self.server.viewing_active)
+        status, _, _ = self._close_window()
         self.assertEqual(status, 200)
-        self.assertEqual(self.server.viewing_window_until, 0.0)
+        self.assertFalse(self.server.viewing_active)
 
 
 if __name__ == "__main__":
