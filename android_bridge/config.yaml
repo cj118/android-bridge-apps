@@ -1,5 +1,5 @@
 name: "Android Bridge (b5)"
-version: "0.2.0"
+version: "0.2.1"
 slug: android_bridge
 description: "Read-only Android screen bridge (no device paired)"
 arch:
