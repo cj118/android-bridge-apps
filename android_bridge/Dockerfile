@@ -3,11 +3,13 @@ FROM python:3.12-alpine
 WORKDIR /app
 
 COPY app/server.py /app/server.py
+COPY app/adbctl.py /app/adbctl.py
+COPY app/pngcheck.py /app/pngcheck.py
 COPY app/entrypoint.sh /entrypoint.sh
 
 RUN addgroup -g 10001 app \
  && adduser -D -H -u 10001 -G app app \
- && apk add --no-cache su-exec \
+ && apk add --no-cache su-exec android-tools \
  && chmod 0755 /entrypoint.sh
 
 ENV HOME=/data

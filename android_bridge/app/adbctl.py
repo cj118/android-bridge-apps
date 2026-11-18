@@ -1,0 +1,138 @@
+"""Narrow ADB wrapper for the Android Bridge.
+
+Only the operations below exist. There is no shell passthrough, no arbitrary
+command runner and no caller-supplied argument. Every value is validated
+against a fixed pattern before it reaches the adb binary.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+
+ADB_BINARY = os.environ.get("BRIDGE_ADB_BINARY", "adb")
+DEFAULT_TIMEOUT = 20.0
+PAIR_TIMEOUT = 30.0
+MAX_OUTPUT_BYTES = 12 * 1024 * 1024
+
+_HOST_RE = re.compile(r"\A[A-Za-z0-9.-]{1,253}\Z")
+_PORT_RE = re.compile(r"\A[0-9]{1,5}\Z")
+_CODE_RE = re.compile(r"\A[0-9]{6}\Z")
+_SERIAL_RE = re.compile(r"\A[^\s]{1,128}\Z")
+
+
+class AdbError(RuntimeError):
+    """An ADB operation failed. Messages are fixed; no device data leaks."""
+
+
+def _host(value: str) -> str:
+    value = (value or "").strip()
+    if not _HOST_RE.match(value):
+        raise AdbError("invalid host")
+    return value
+
+
+def _port(value: str) -> str:
+    value = str(value or "").strip()
+    if not _PORT_RE.match(value) or not 1 <= int(value) <= 65535:
+        raise AdbError("invalid port")
+    return value
+
+
+def _serial(value: str) -> str:
+    value = (value or "").strip()
+    if not _SERIAL_RE.match(value):
+        raise AdbError("invalid serial")
+    return value
+
+
+def _run(args, timeout=DEFAULT_TIMEOUT, stdin_data=None, max_bytes=MAX_OUTPUT_BYTES):
+    command = [ADB_BINARY] + list(args)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError:
+        raise AdbError("adb unavailable") from None
+
+    try:
+        out, _err = process.communicate(stdin_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise AdbError("timeout") from None
+
+    if len(out) > max_bytes:
+        raise AdbError("output too large")
+    return process.returncode, out
+
+
+def pair(host: str, port: str, code: str, timeout: float = PAIR_TIMEOUT) -> None:
+    """Pair with a device. The code is delivered on stdin, never as argv."""
+    target = "%s:%s" % (_host(host), _port(port))
+    code = (code or "").strip()
+    if not _CODE_RE.match(code):
+        raise AdbError("invalid pairing code")
+    returncode, _out = _run(
+        ["pair", target],
+        timeout=timeout,
+        stdin_data=(code + "\n").encode("ascii"),
+        max_bytes=65536,
+    )
+    if returncode != 0:
+        raise AdbError("pairing failed")
+
+
+def connect(host: str, port: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+    target = "%s:%s" % (_host(host), _port(port))
+    returncode, out = _run(["connect", target], timeout=timeout, max_bytes=65536)
+    if returncode != 0 or b"connected" not in out.lower():
+        raise AdbError("connect failed")
+
+
+def disconnect(serial: str, timeout: float = 10.0) -> None:
+    _run(["disconnect", _serial(serial)], timeout=timeout, max_bytes=65536)
+
+
+def list_devices(timeout: float = 10.0):
+    """Return [{'serial': str, 'model': str}] for devices in state 'device'."""
+    returncode, out = _run(["devices", "-l"], timeout=timeout, max_bytes=65536)
+    if returncode != 0:
+        raise AdbError("device list failed")
+
+    devices = []
+    for line in out.decode("utf-8", "replace").splitlines()[1:]:
+        line = line.strip()
+        if not line or line.startswith("*"):
+            continue
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "device":
+            continue
+        info = {}
+        for token in parts[2:]:
+            if ":" in token:
+                key, value = token.split(":", 1)
+                info[key] = value
+        devices.append({"serial": parts[0], "model": info.get("model", "")})
+    return devices
+
+
+def screencap(serial: str, timeout: float = DEFAULT_TIMEOUT):
+    """Fixed capture command. No arguments come from the caller."""
+    returncode, out = _run(
+        ["-s", _serial(serial), "exec-out", "screencap", "-p"],
+        timeout=timeout,
+        max_bytes=MAX_OUTPUT_BYTES,
+    )
+    if returncode != 0:
+        raise AdbError("capture failed")
+    if not out:
+        raise AdbError("empty capture")
+    return out

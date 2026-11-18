@@ -1,11 +1,12 @@
-"""Android Bridge - stage 1: authenticated control surface only.
+"""Android Bridge - read-only screen viewing over wireless ADB.
 
-No ADB. No device access. No screenshot capture.
-The screenshot endpoint is a disabled placeholder.
+Exposes: /health, /status, /screenshot, /pair (form), POST /pair,
+POST /connect, POST /disconnect. No shell, no input injection.
 """
 
 from __future__ import annotations
 
+import base64
 import errno
 import hmac
 import http.client
@@ -13,34 +14,102 @@ import json
 import os
 import re
 import secrets
+import socket
 import stat
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.1"
+import adbctl
+import pngcheck
+
+VERSION = "0.2.2"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
 MAX_BODY_BYTES = 8 * 1024
 MAX_URI_LENGTH = 2048
 MAX_TOKEN_FILE_BYTES = 512
+MAX_CAPTURE_BYTES = 12 * 1024 * 1024
 AUTH_FAIL_DELAY_SECONDS = 0.2
-SOCKET_TIMEOUT_SECONDS = 10
+SOCKET_TIMEOUT_SECONDS = 15
 MAX_CONNECTIONS = 16
+CAPTURE_MIN_INTERVAL_SECONDS = 2.0
+CAPTURE_WINDOW_SECONDS = 60.0
+CAPTURE_WINDOW_MAX = 6
+
 SELFTEST_DELAY_SECONDS = 0.5
 SELFTEST_TIMEOUT_SECONDS = 5.0
 SELFTEST_MAX_ATTEMPTS = 3
 SELFTEST_PATH = "/status"
 
+# Container DNS names allowed to call /mcp without a bearer token.
+# The credential is the container's network identity, not a shared secret.
+MCP_ALLOWED_HOSTS = (
+    "f5588468-ha-opencode",
+    "f5588468-ha-opencode-beta",
+)
+MCP_ALLOWLIST_TTL_SECONDS = 30.0
+VIEWING_WINDOW_DEFAULT_MINUTES = 10
+VIEWING_WINDOW_MAX_MINUTES = 30
+_ALLOWLIST = {"ips": frozenset(), "at": 0.0}
+
+
+def _resolve_host_ips(host):
+    try:
+        return {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except OSError:
+        return set()
+
+
+def refresh_mcp_allowlist(force=False):
+    now = time.monotonic()
+    if (
+        not force
+        and _ALLOWLIST["ips"]
+        and now - _ALLOWLIST["at"] < MCP_ALLOWLIST_TTL_SECONDS
+    ):
+        return _ALLOWLIST["ips"]
+    ips = set()
+    for host in MCP_ALLOWED_HOSTS:
+        ips |= _resolve_host_ips(host)
+    _ALLOWLIST["ips"] = frozenset(ips)
+    _ALLOWLIST["at"] = now
+    return _ALLOWLIST["ips"]
+
+
+def mcp_source_allowed(address):
+    return address in refresh_mcp_allowlist()
+
 _TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{32,128}\Z")
 _LOGGABLE_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 _DUMMY_TOKEN = b"x" * 43
 
+_PAIR_PAGE = (
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<title>Android Bridge - pair</title></head>"
+    "<body style='font-family:system-ui;max-width:34rem;margin:3rem auto'>"
+    "<h1>Pair tablet</h1>"
+    "<p>On the tablet: Settings &rarr; Developer options &rarr; Wireless debugging."
+    " The tablet shows a pairing port and a separate connect port.</p>"
+    "<form method='post' action='pair'>"
+    "<p><label>Bearer token<br><input name='token' type='password' size='54'></label></p>"
+    "<p><label>Tablet IP<br><input name='host' size='30'></label></p>"
+    "<p><label>Pairing port<br><input name='pairing_port' size='8'></label></p>"
+    "<p><label>6-digit pairing code<br><input name='code' size='8'></label></p>"
+    "<p><label>Connect port<br><input name='connect_port' size='8'></label></p>"
+    "<p><button type='submit'>Pair and connect</button></p>"
+    "</form></body></html>"
+).encode("utf-8")
+
 
 class TokenError(RuntimeError):
     """The private token store is missing, unsafe or malformed."""
+
+
+# ---------------------------------------------------------------- token store
 
 
 def private_dir(data_dir: str = DEFAULT_DATA_DIR) -> str:
@@ -51,16 +120,18 @@ def token_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
     return os.path.join(private_dir(data_dir), "token")
 
 
+def device_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
+    return os.path.join(private_dir(data_dir), "device.json")
+
+
 def _ensure_private_dir(data_dir: str) -> str:
     if not os.path.isdir(data_dir) or os.path.islink(data_dir):
         raise TokenError("data directory is missing or unsafe")
-
     path = private_dir(data_dir)
     try:
         os.makedirs(path, mode=0o700, exist_ok=True)
     except OSError:
         raise TokenError("private directory cannot be created") from None
-
     info = os.lstat(path)
     if stat.S_ISLNK(info.st_mode):
         raise TokenError("private directory is a symlink")
@@ -83,7 +154,6 @@ def _read_token_file(path: str) -> bytes:
         if exc.errno == errno.ENOENT:
             raise TokenError("token file disappeared during startup") from None
         raise TokenError("token file cannot be opened") from None
-
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
@@ -92,7 +162,6 @@ def _read_token_file(path: str) -> bytes:
             raise TokenError("token file has an unexpected owner")
         if stat.S_IMODE(info.st_mode) & 0o077:
             raise TokenError("token file permissions are too open")
-
         chunks = []
         total = 0
         while True:
@@ -105,7 +174,6 @@ def _read_token_file(path: str) -> bytes:
             chunks.append(chunk)
     finally:
         os.close(descriptor)
-
     raw = b"".join(chunks).strip()
     if not raw:
         raise TokenError("token file is empty")
@@ -119,23 +187,19 @@ def _read_token_file(path: str) -> bytes:
 
 
 def _create_token_file(path: str) -> bytes | None:
-    """Atomically create the token; returns None if another writer won."""
     token = secrets.token_urlsafe(32).encode("ascii")
     directory = os.path.dirname(path)
     temporary = os.path.join(directory, ".token.%s.tmp" % secrets.token_hex(8))
-
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(temporary, flags, 0o600)
     except OSError:
         raise TokenError("temporary token file cannot be created") from None
-
     try:
         os.write(descriptor, token + b"\n")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-
     try:
         os.link(temporary, path)
     except FileExistsError:
@@ -147,30 +211,97 @@ def _create_token_file(path: str) -> bytes | None:
             os.unlink(temporary)
         except OSError:
             pass
-
-    try:
-        directory_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except OSError:
-        pass
-
     return token
 
 
 def load_or_create_token(data_dir: str = DEFAULT_DATA_DIR) -> bytes:
     _ensure_private_dir(data_dir)
     path = token_path(data_dir)
-
     if os.path.lexists(path):
         return _read_token_file(path)
-
     created = _create_token_file(path)
     if created is not None:
         return created
     return _read_token_file(path)
+
+
+# --------------------------------------------------------------- device state
+
+
+def load_device(data_dir: str = DEFAULT_DATA_DIR) -> dict:
+    try:
+        with open(device_path(data_dir), "rb") as handle:
+            info = json.loads(handle.read(2048))
+        host = info.get("host")
+        port = info.get("connect_port")
+        if isinstance(host, str) and isinstance(port, str):
+            return {"host": host, "connect_port": port}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_device(data_dir: str, host: str, connect_port: str) -> None:
+    _ensure_private_dir(data_dir)
+    path = device_path(data_dir)
+    temporary = path + ".tmp"
+    payload = json.dumps({"host": host, "connect_port": connect_port}).encode("utf-8")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+
+
+# ---------------------------------------------------------------- self-test
+
+
+def run_auth_selftest(port, token, host="127.0.0.1", timeout=SELFTEST_TIMEOUT_SECONDS):
+    """Loopback request through the normal bearer authentication path."""
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request(
+            "GET",
+            SELFTEST_PATH,
+            headers={"Authorization": "Bearer " + token.decode("ascii")},
+        )
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+
+def _schedule_auth_selftest(server, port: int) -> None:
+    def worker():
+        status = None
+        time.sleep(SELFTEST_DELAY_SECONDS)
+        for attempt in range(SELFTEST_MAX_ATTEMPTS):
+            status = run_auth_selftest(port, server.token)
+            if status is not None:
+                break
+            if attempt + 1 < SELFTEST_MAX_ATTEMPTS:
+                time.sleep(SELFTEST_DELAY_SECONDS)
+        if status == 200:
+            sys.stderr.write("auth_selftest=PASS http=%d\n" % status)
+        else:
+            sys.stderr.write("auth_selftest=FAIL\n")
+
+    threading.Thread(target=worker, name="auth-selftest", daemon=True).start()
+
+
+# -------------------------------------------------------------------- handler
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -183,6 +314,11 @@ class Handler(BaseHTTPRequestHandler):
         "/health": "health",
         "/status": "status",
         "/screenshot": "screenshot",
+        "/pair": "pair",
+        "/connect": "connect",
+        "/disconnect": "disconnect",
+        "/mcp": "mcp",
+        "/window": "window",
     }
 
     def _send_json(self, code, payload, extra_headers=None):
@@ -194,6 +330,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_png(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -219,6 +373,12 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return -1
 
+    def _token_matches(self, candidate: str) -> bool:
+        if not candidate or not _TOKEN_RE.match(candidate):
+            hmac.compare_digest(_DUMMY_TOKEN, self.server.token)
+            return False
+        return hmac.compare_digest(candidate.encode("ascii"), self.server.token)
+
     def _presented_token(self):
         values = self.headers.get_all("Authorization") or []
         if len(values) != 1:
@@ -226,20 +386,30 @@ class Handler(BaseHTTPRequestHandler):
         parts = values[0].split()
         if len(parts) != 2 or parts[0].lower() != "bearer":
             return None
-        candidate = parts[1]
-        if not _TOKEN_RE.match(candidate):
-            return None
-        return candidate.encode("ascii")
+        return parts[1]
 
-    def _authorized(self) -> bool:
+    def _authorized(self, form_token=None) -> bool:
         candidate = self._presented_token()
-        if candidate is None:
-            hmac.compare_digest(_DUMMY_TOKEN, self.server.token)
-            return False
-        return hmac.compare_digest(candidate, self.server.token)
+        if candidate is not None:
+            return self._token_matches(candidate)
+        if form_token is not None:
+            return self._token_matches(form_token)
+        hmac.compare_digest(_DUMMY_TOKEN, self.server.token)
+        return False
 
-    def _require_auth(self) -> bool:
-        if self._authorized():
+    def _mcp_gate(self):
+        """Return (allowed, error). Bearer wins; otherwise address AND window."""
+        values = self.headers.get_all("Authorization") or []
+        if values:
+            return self._authorized(), "unauthorized"
+        if not mcp_source_allowed(self.client_address[0]):
+            return False, "unauthorized"
+        if self.server.viewing_window_until <= time.monotonic():
+            return False, "viewing_window_closed"
+        return True, None
+
+    def _require_auth(self, form_token=None) -> bool:
+        if self._authorized(form_token):
             return True
         time.sleep(AUTH_FAIL_DELAY_SECONDS)
         self._send_json(
@@ -249,6 +419,21 @@ class Handler(BaseHTTPRequestHandler):
         )
         return False
 
+    def _resolve_device(self):
+        info = load_device(self.server.data_dir)
+        if not info:
+            return info, None
+        try:
+            devices = adbctl.list_devices()
+        except adbctl.AdbError:
+            return info, None
+        matches = [d for d in devices if d["serial"].startswith(info["host"] + ":")]
+        if len(matches) != 1:
+            return info, None
+        return info, matches[0]
+
+    # ---------- GET ----------
+
     def do_GET(self):
         if len(self.path) > MAX_URI_LENGTH:
             self.close_connection = True
@@ -257,9 +442,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._route_get()
         except Exception as exc:
-            sys.stderr.write(
-                "android-bridge: handler error: %s\n" % type(exc).__name__
-            )
+            sys.stderr.write("android-bridge: handler error: %s\n" % type(exc).__name__)
             try:
                 self._send_json(500, {"error": "internal_error"})
             except Exception:
@@ -272,18 +455,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
 
+        if path == "/pair":
+            self._send_html(_PAIR_PAGE)
+            return
+
         if path == "/status":
             if not self._require_auth():
                 return
+            info = load_device(self.server.data_dir)
+            device = None
+            if info:
+                try:
+                    _info, device = self._resolve_device()
+                except adbctl.AdbError:
+                    device = None
             self._send_json(
                 200,
                 {
                     "status": "ok",
                     "version": VERSION,
-                    "stage": "auth-only",
-                    "paired": False,
-                    "connected": False,
-                    "screenshot_enabled": False,
+                    "stage": "read-only-screenshot",
+                    "paired": bool(info),
+                    "connected": device is not None,
+                    "device_model": device["model"] if device else "",
+                    "screenshot_enabled": True,
                     "uptime_seconds": int(
                         time.monotonic() - self.server.started_monotonic
                     ),
@@ -294,29 +489,325 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/screenshot":
             if not self._require_auth():
                 return
-            self._send_json(
-                503,
-                {"error": "screenshot_unavailable", "reason": "not_implemented"},
-            )
+            self._handle_screenshot()
             return
 
         self._send_json(404, {"error": "not_found"})
 
-    def _reject_method(self):
+    _ERROR_STATUS = {
+        "capture_busy": 429,
+        "rate_limited": 429,
+        "device_not_paired": 409,
+        "device_not_connected": 409,
+        "capture_timeout": 504,
+        "image_too_large": 502,
+        "capture_failed": 502,
+        "invalid_image": 502,
+    }
+
+    def _capture_bytes(self):
+        """Capture once with rate limiting. Returns (png_or_None, error_code)."""
+        if not self.server.capture_lock.acquire(blocking=False):
+            return None, "capture_busy"
+        try:
+            now = time.monotonic()
+            times = self.server.capture_times
+            while times and now - times[0] > CAPTURE_WINDOW_SECONDS:
+                times.pop(0)
+            if len(times) >= CAPTURE_WINDOW_MAX:
+                return None, "rate_limited"
+            if times and now - times[-1] < CAPTURE_MIN_INTERVAL_SECONDS:
+                return None, "rate_limited"
+
+            info = load_device(self.server.data_dir)
+            if not info:
+                return None, "device_not_paired"
+            _info, device = self._resolve_device()
+            if device is None:
+                return None, "device_not_connected"
+
+            try:
+                data = adbctl.screencap(device["serial"], timeout=20.0)
+                pngcheck.validate(data, max_bytes=MAX_CAPTURE_BYTES)
+            except adbctl.AdbError as exc:
+                if str(exc) == "timeout":
+                    return None, "capture_timeout"
+                if str(exc) == "output too large":
+                    return None, "image_too_large"
+                return None, "capture_failed"
+            except pngcheck.PngError:
+                return None, "invalid_image"
+
+            times.append(now)
+            return data, None
+        finally:
+            self.server.capture_lock.release()
+
+    def _handle_screenshot(self):
+        data, error = self._capture_bytes()
+        if error is not None:
+            status = self._ERROR_STATUS.get(error, 502)
+            headers = {"Retry-After": "5"} if status == 429 else None
+            self._send_json(status, {"error": error}, headers)
+            return
+        self._send_png(data)
+
+    # ---------- MCP (read-only tools) ----------
+
+    MCP_TOOLS = [
+        {
+            "name": "android_screenshot",
+            "description": (
+                "Capture the connected Android tablet screen once and return it "
+                "as a PNG image. Read-only; no input is sent to the device."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "android_status",
+            "description": "Report whether the tablet is paired and connected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+    def _handle_mcp(self, body):
+        try:
+            message = json.loads(body.decode("utf-8", "replace"))
+        except ValueError:
+            self._send_json(
+                200,
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32700, "message": "parse error"}},
+            )
+            return
+
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or "method" not in message:
+            self._send_json(
+                200,
+                {"jsonrpc": "2.0", "id": None,
+                 "error": {"code": -32600, "message": "invalid request"}},
+            )
+            return
+
+        method = message.get("method")
+        message_id = message.get("id")
+
+        if method.startswith("notifications/"):
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "android-bridge", "version": VERSION},
+            }
+        elif method == "tools/list":
+            result = {"tools": self.MCP_TOOLS}
+        elif method == "ping":
+            result = {}
+        elif method == "tools/call":
+            self._mcp_tool_call(message, message_id)
+            return
+        else:
+            self._send_json(
+                200,
+                {"jsonrpc": "2.0", "id": message_id,
+                 "error": {"code": -32601, "message": "method not found"}},
+            )
+            return
+
+        self._send_json(200, {"jsonrpc": "2.0", "id": message_id, "result": result})
+
+    def _mcp_tool_call(self, message, message_id):
+        params = message.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+        name = params.get("name")
+
+        if name == "android_status":
+            info = load_device(self.server.data_dir)
+            _info, device = self._resolve_device()
+            payload = {
+                "paired": bool(info),
+                "connected": device is not None,
+                "device_model": device["model"] if device else "",
+            }
+            result = {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "isError": False,
+            }
+            self._send_json(200, {"jsonrpc": "2.0", "id": message_id, "result": result})
+            return
+
+        if name == "android_screenshot":
+            data, error = self._capture_bytes()
+            if error is not None:
+                result = {
+                    "content": [{"type": "text", "text": error}],
+                    "isError": True,
+                }
+            else:
+                result = {
+                    "content": [
+                        {
+                            "type": "image",
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "mimeType": "image/png",
+                        }
+                    ],
+                    "isError": False,
+                }
+            self._send_json(200, {"jsonrpc": "2.0", "id": message_id, "result": result})
+            return
+
+        self._send_json(
+            200,
+            {"jsonrpc": "2.0", "id": message_id,
+             "error": {"code": -32602, "message": "unknown tool"}},
+        )
+
+    # ---------- POST ----------
+
+    def do_POST(self):
+        if len(self.path) > MAX_URI_LENGTH:
+            self.close_connection = True
+            self._send_json(414, {"error": "uri_too_long"})
+            return
         length = self._content_length()
-        self.close_connection = True
         if length < 0:
+            self.close_connection = True
             self._send_json(400, {"error": "bad_content_length"})
             return
         if length > MAX_BODY_BYTES:
-            self._send_json(
-                413, {"error": "payload_too_large"}, {"Connection": "close"}
-            )
+            self.close_connection = True
+            self._send_json(413, {"error": "payload_too_large"}, {"Connection": "close"})
             return
-        self._send_json(405, {"error": "method_not_allowed"}, {"Allow": "GET"})
+        body = self.rfile.read(length) if length else b""
+        try:
+            self._route_post(body)
+        except Exception as exc:
+            sys.stderr.write("android-bridge: handler error: %s\n" % type(exc).__name__)
+            try:
+                self._send_json(500, {"error": "internal_error"})
+            except Exception:
+                self.close_connection = True
 
-    def do_POST(self):
-        self._reject_method()
+    def _route_post(self, body: bytes):
+        path = self._path_only()
+        if path == "/mcp":
+            allowed, error = self._mcp_gate()
+            if not allowed:
+                time.sleep(AUTH_FAIL_DELAY_SECONDS)
+                status = 401 if error == "unauthorized" else 403
+                self._send_json(
+                    status,
+                    {"error": error},
+                    {"WWW-Authenticate": 'Bearer realm="android-bridge"'},
+                )
+                return
+            self._handle_mcp(body)
+            return
+        if path not in ("/pair", "/connect", "/disconnect", "/window"):
+            self.close_connection = True
+            self._send_json(405, {"error": "method_not_allowed"}, {"Allow": "GET"})
+            return
+
+        fields = {}
+        try:
+            parsed = urllib.parse.parse_qs(
+                body.decode("utf-8", "replace"), keep_blank_values=True
+            )
+            fields = {key: values[0] for key, values in parsed.items() if values}
+        except ValueError:
+            fields = {}
+
+        if not self._require_auth(fields.get("token")):
+            return
+        fields.pop("token", None)
+
+        if path == "/window":
+            self._do_window(fields)
+        elif path == "/pair":
+            self._do_pair(fields)
+        elif path == "/connect":
+            self._do_connect(fields)
+        else:
+            self._do_disconnect()
+
+    def _do_window(self, fields):
+        raw = (fields.get("minutes") or "").strip()
+        try:
+            minutes = int(raw) if raw else VIEWING_WINDOW_DEFAULT_MINUTES
+        except ValueError:
+            self._send_json(400, {"error": "invalid_minutes"})
+            return
+        if minutes < 0:
+            self._send_json(400, {"error": "invalid_minutes"})
+            return
+        minutes = min(minutes, VIEWING_WINDOW_MAX_MINUTES)
+        if minutes == 0:
+            self.server.viewing_window_until = 0.0
+            self._send_json(200, {"window": "closed"})
+            return
+        self.server.viewing_window_until = time.monotonic() + minutes * 60
+        self._send_json(200, {"window": "open", "minutes": minutes})
+
+    def _do_pair(self, fields):
+        host = (fields.get("host") or "").strip()
+        pairing_port = (fields.get("pairing_port") or "").strip()
+        code = (fields.get("code") or "").strip()
+        connect_port = (fields.get("connect_port") or "").strip()
+        try:
+            adbctl.pair(host, pairing_port, code)
+            adbctl.connect(host, connect_port)
+        except adbctl.AdbError:
+            self._send_json(400, {"error": "pairing_failed"})
+            return
+        try:
+            save_device(self.server.data_dir, host, connect_port)
+        except OSError:
+            self._send_json(500, {"error": "state_write_failed"})
+            return
+        self._send_json(200, {"status": "paired"})
+
+    def _do_connect(self, fields):
+        host = (fields.get("host") or "").strip()
+        port = (fields.get("connect_port") or "").strip()
+        try:
+            adbctl.connect(host, port)
+        except adbctl.AdbError:
+            self._send_json(400, {"error": "connect_failed"})
+            return
+        try:
+            save_device(self.server.data_dir, host, port)
+        except OSError:
+            self._send_json(500, {"error": "state_write_failed"})
+            return
+        self._send_json(200, {"status": "connected"})
+
+    def _do_disconnect(self):
+        try:
+            for device in adbctl.list_devices():
+                adbctl.disconnect(device["serial"])
+        except adbctl.AdbError:
+            self._send_json(502, {"error": "disconnect_failed"})
+            return
+        self._send_json(200, {"status": "disconnected"})
+
+    def _reject_method(self):
+        self.close_connection = True
+        self._send_json(405, {"error": "method_not_allowed"}, {"Allow": "GET, POST"})
 
     def do_PUT(self):
         self._reject_method()
@@ -358,56 +849,14 @@ class BridgeServer(ThreadingHTTPServer):
             self._slots.release()
 
 
-def run_auth_selftest(
-    port: int,
-    token: bytes,
-    host: str = "127.0.0.1",
-    timeout: float = SELFTEST_TIMEOUT_SECONDS,
-):
-    """Exercise normal bearer authentication over loopback without logging token."""
-    connection = http.client.HTTPConnection(host, port, timeout=timeout)
-    try:
-        connection.request(
-            "GET",
-            SELFTEST_PATH,
-            headers={"Authorization": "Bearer " + token.decode("ascii")},
-        )
-        response = connection.getresponse()
-        response.read()
-        return response.status
-    except (OSError, ValueError, http.client.HTTPException):
-        return None
-    finally:
-        connection.close()
-
-
-def _schedule_auth_selftest(server, port: int) -> None:
-    """Run a single startup check, retrying only connection failures."""
-    def worker():
-        status = None
-        time.sleep(SELFTEST_DELAY_SECONDS)
-        for attempt in range(SELFTEST_MAX_ATTEMPTS):
-            status = run_auth_selftest(port, server.token)
-            if status is not None:
-                break
-            if attempt + 1 < SELFTEST_MAX_ATTEMPTS:
-                time.sleep(SELFTEST_DELAY_SECONDS)
-        if status == 200:
-            sys.stderr.write("auth_selftest=PASS http=200\n")
-        else:
-            sys.stderr.write("auth_selftest=FAIL\n")
-
-    threading.Thread(target=worker, name="auth-selftest", daemon=True).start()
-
-
-def create_server(
-    host: str = "0.0.0.0",
-    port: int = PORT,
-    data_dir: str = DEFAULT_DATA_DIR,
-) -> BridgeServer:
+def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     token = load_or_create_token(data_dir)
     server = BridgeServer((host, port), Handler)
     server.token = token
+    server.data_dir = data_dir
+    server.capture_lock = threading.Lock()
+    server.capture_times = []
+    server.viewing_window_until = 0.0
     server.started_monotonic = time.monotonic()
     return server
 

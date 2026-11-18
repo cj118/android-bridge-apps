@@ -5,27 +5,35 @@ APP_UID=10001
 APP_GID=10001
 DATA_DIR="${BRIDGE_DATA_DIR:-/data}"
 PRIVATE_DIR="$DATA_DIR/private"
+ANDROID_DIR="$DATA_DIR/.android"
 
 if [ -L "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
     echo "android-bridge: fatal: data directory is missing or a symlink" >&2
     exit 1
 fi
 
-# /data is created by the Supervisor owned by root; the service runs as uid 10001.
 chown "$APP_UID:$APP_GID" "$DATA_DIR" 2>/dev/null || true
 
 if [ -L "$PRIVATE_DIR" ]; then
     echo "android-bridge: fatal: private directory is a symlink" >&2
     exit 1
 fi
-
 if [ ! -d "$PRIVATE_DIR" ]; then
     mkdir -p "$PRIVATE_DIR"
 fi
-
 chown "$APP_UID:$APP_GID" "$PRIVATE_DIR" 2>/dev/null || true
 chmod 0700 "$PRIVATE_DIR" 2>/dev/null || true
 
-# The token file is deliberately NOT touched here.
-# The application verifies its type, owner and permissions.
+# ADB private key home. Created as a plain directory, never a symlink.
+if [ -L "$ANDROID_DIR" ]; then
+    echo "android-bridge: fatal: adb home is a symlink" >&2
+    exit 1
+fi
+if [ ! -d "$ANDROID_DIR" ]; then
+    mkdir -p "$ANDROID_DIR"
+fi
+chown "$APP_UID:$APP_GID" "$ANDROID_DIR" 2>/dev/null || true
+chmod 0700 "$ANDROID_DIR" 2>/dev/null || true
+
+# The token and adbkey files are never touched here: chown follows symlinks.
 exec su-exec "$APP_UID:$APP_GID" python3 -u /app/server.py

@@ -173,7 +173,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         text = body.decode("utf-8")
         self.assertIn('"paired":false', text)
-        self.assertIn('"screenshot_enabled":false', text)
+        self.assertIn('"screenshot_enabled":true', text)
         self.assertNotIn(self.token, text)
 
     def test_malformed_and_incorrect_tokens_are_401(self):
@@ -215,10 +215,10 @@ class ServerTests(unittest.TestCase):
         status, _, _ = self.request("GET", "/screenshot")
         self.assertEqual(status, 401)
 
-    def test_screenshot_with_token_is_controlled_503(self):
+    def test_screenshot_with_token_without_device_is_409(self):
         status, body, _ = self.request("GET", "/screenshot", self.auth())
-        self.assertEqual(status, 503)
-        self.assertIn(b"screenshot_unavailable", body)
+        self.assertEqual(status, 409)
+        self.assertIn(b"device_not_paired", body)
 
     def test_oversize_declared_body_is_413(self):
         payload = (
