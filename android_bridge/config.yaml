@@ -1,0 +1,17 @@
+name: "Android Bridge (repo)"
+version: "0.1.0"
+slug: android_bridge
+description: "Read-only Android screen bridge (no device paired)"
+arch:
+  - amd64
+startup: application
+boot: manual
+init: false
+ingress: true
+ingress_port: 8791
+panel_title: "Android Bridge (repo)"
+panel_icon: mdi:cellphone-link
+hassio_api: false
+homeassistant_api: false
+auth_api: false
+map: []
