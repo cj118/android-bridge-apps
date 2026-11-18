@@ -1,0 +1,23 @@
+name: Android Bridge B5 Tests
+
+on:
+  push:
+    branches: [b5]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out b5
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Android Bridge unit tests
+        run: python3 -m unittest discover -s android_bridge/tests -v
