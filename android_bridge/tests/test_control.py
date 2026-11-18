@@ -329,5 +329,23 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertFalse(self.server.viewing_active)
 
 
+    def test_root_redirects_to_control(self):
+        status, _, headers = self.req("GET", "/")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/control")
+
+    def test_root_redirect_respects_ingress_prefix(self):
+        status, _, headers = self.req(
+            "GET", "/", {"X-Ingress-Path": "/api/hassio_ingress/abc123"}
+        )
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/api/hassio_ingress/abc123/control")
+
+    def test_index_also_redirects(self):
+        status, _, headers = self.req("GET", "/index.html")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/control")
+
+
 if __name__ == "__main__":
     unittest.main()

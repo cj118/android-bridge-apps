@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.2.2"
+VERSION = "0.3.1"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -465,6 +465,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_get(self):
         path = self._path_only()
+
+        if path in ("/", "/index.html"):
+            prefix = self.headers.get("X-Ingress-Path", "").rstrip("/")
+            self.send_response(302)
+            self.send_header("Location", prefix + "/control")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
 
         if path == "/health":
             self._send_json(200, {"status": "ok"})
