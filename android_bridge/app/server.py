@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -334,6 +334,10 @@ class Handler(BaseHTTPRequestHandler):
         "/mcp": "mcp",
         "/window": "window",
         "/control": "control",
+        "/control/session": "control-session",
+        "/control/approve": "control-approve",
+        "/control/reject": "control-reject",
+        "/control/stop": "control-stop",
     }
 
     def _send_json(self, code, payload, extra_headers=None):
@@ -1007,11 +1011,23 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(session["csrf"], provided)
 
     def _origin_ok(self):
+        """Accept same-origin browser posts through the Home Assistant ingress.
+
+        HA ingress forwards Sec-Fetch-Site and X-Forwarded-Host and may drop or
+        rewrite Origin/Host, so Origin equality alone cannot be trusted here.
+        The session cookie and the session-bound CSRF token remain mandatory.
+        """
+        site = self.headers.get("Sec-Fetch-Site")
+        if site in ("same-origin", "none"):
+            return True
         origin = self.headers.get("Origin")
         if not origin:
-            return False
-        host = self.headers.get("Host", "")
-        return urllib.parse.urlparse(origin).netloc == host and bool(host)
+            return True
+        expected = (
+            self.headers.get("X-Forwarded-Host")
+            or self.headers.get("Host", "")
+        )
+        return bool(expected) and urllib.parse.urlparse(origin).netloc == expected
 
     def _send_html_with(self, body, headers=None):
         self.send_response(200)

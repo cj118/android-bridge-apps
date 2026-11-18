@@ -228,7 +228,18 @@ class ControlSecurityTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
-    def test_foreign_origin_is_forbidden(self):
+    def test_cross_site_request_is_forbidden(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "http://evil.example",
+             "Sec-Fetch-Site": "cross-site"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_foreign_origin_without_fetch_metadata_is_forbidden(self):
         cookie, csrf = self.start_control()
         key = self.new_proposal()
         status, _, _ = self.form(
@@ -236,7 +247,35 @@ class ControlSecurityTests(unittest.TestCase):
             {**cookie, "Origin": "http://evil.example"},
         )
         self.assertEqual(status, 403)
-        self.assertNotIn("'input'", self.adb_log())
+
+    def test_ingress_request_without_origin_is_allowed(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf}, cookie
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("'input'", self.adb_log())
+
+    def test_ingress_forwarded_host_is_accepted(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "https://ha.example",
+             "X-Forwarded-Host": "ha.example"},
+        )
+        self.assertEqual(status, 200)
+
+    def test_ingress_same_origin_fetch_metadata_is_accepted(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "https://ha.example",
+             "Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(status, 200)
 
     def test_csrf_is_bound_to_session(self):
         _, csrf_a = self.start_control()
