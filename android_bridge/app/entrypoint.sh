@@ -35,6 +35,9 @@ fi
 chown "$APP_UID:$APP_GID" "$ANDROID_DIR" 2>/dev/null || true
 chmod 0700 "$ANDROID_DIR" 2>/dev/null || true
 
+# Repair adb key ownership left behind by earlier root runs. Content is kept.
+python3 /app/adb_home.py "$ANDROID_DIR" "$APP_UID" "$APP_GID" || true
+
 # Root-only handoff: copy ONLY allowed_ha_users out of the Supervisor-managed
 # options file. That file stays root-readable; the app user never sees it.
 python3 /app/options_bridge.py \

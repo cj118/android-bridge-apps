@@ -27,7 +27,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.11"
+VERSION = "0.3.12"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -477,6 +477,25 @@ class Handler(BaseHTTPRequestHandler):
             {"WWW-Authenticate": 'Bearer realm="android-bridge"'},
         )
         return False
+
+    def _adb_key_state(self):
+        path = os.path.join(self.server.data_dir, ".android", "adbkey")
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return "missing"
+        if not stat.S_ISREG(info.st_mode):
+            return "unreadable"
+        if info.st_uid != os.geteuid():
+            return "unreadable"
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            return "unreadable"
+        try:
+            with open(path, "rb") as handle:
+                handle.read(1)
+        except OSError:
+            return "unreadable"
+        return "ok"
 
     def _resolve_device(self):
         info = load_device(self.server.data_dir)
@@ -1606,10 +1625,17 @@ class Handler(BaseHTTPRequestHandler):
         except adbctl.AdbError as exc:
             self._send_json(400, {"error": str(exc)})
             return
+        if self._adb_key_state() == "unreadable":
+            sys.stderr.write("pairing_failed reason=key_unreadable\n")
+            self._respond({"error": "pairing_failed"}, 400, flash="pair_failed")
+            return
         try:
             adbctl.pair(host, pairing_port, code)
             adbctl.connect(host, connect_port)
-        except adbctl.AdbError:
+        except adbctl.AdbError as exc:
+            sys.stderr.write(
+                "pairing_failed reason=%s\n" % (exc.reason or "unknown")
+            )
             self._respond({"error": "pairing_failed"}, 400, flash="pair_failed")
             return
         try:
@@ -1625,7 +1651,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             adbctl.validate_target(host, port)
             adbctl.connect(host, port)
-        except adbctl.AdbError:
+        except adbctl.AdbError as exc:
+            sys.stderr.write(
+                "connect_failed reason=%s\n" % (exc.reason or "unknown")
+            )
             self._respond({"error": "connect_failed"}, 400, flash="pair_failed")
             return
         try:
@@ -1707,6 +1736,32 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     return server
 
 
+def _log_adb_key_state(data_dir):
+    path = os.path.join(data_dir, ".android", "adbkey")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        sys.stderr.write("adb key missing\n")
+        return
+    except OSError:
+        sys.stderr.write("adb key unreadable\n")
+        return
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        sys.stderr.write("adb key unreadable\n")
+        return
+    try:
+        with open(path, "rb") as handle:
+            handle.read(1)
+    except OSError:
+        sys.stderr.write("adb key unreadable\n")
+        return
+    sys.stderr.write("adb key ok\n")
+
+
 def _log_adb_version():
     version = adbctl.version()
     if version:
@@ -1716,6 +1771,9 @@ def _log_adb_version():
 
 
 def main() -> int:
+    if os.geteuid() == 0:
+        sys.stderr.write("android-bridge: fatal: refusing to run as root\n")
+        return 1
     try:
         server = create_server()
     except TokenError as exc:
@@ -1728,6 +1786,7 @@ def main() -> int:
         return 1
 
     _log_adb_version()
+    _log_adb_key_state(DEFAULT_DATA_DIR)
     sys.stderr.write(
         "android-bridge %s listening on %d (bearer auth enabled)\n"
         % (VERSION, PORT)

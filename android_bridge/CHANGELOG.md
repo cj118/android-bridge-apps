@@ -1,5 +1,19 @@
 # Android Bridge changelog
 
+## 0.3.12
+
+- Fix: an earlier adb run as root left `/data/.android/adbkey` owned by root, so
+  the unprivileged adb server could not read its own key and aborted with
+  `error: protocol fault (couldn't read status length)`.
+- The entrypoint repairs adb home ownership and modes as root before dropping
+  privileges: directory 0700, `adbkey` 0600, `adbkey.pub` 0644, other adb files
+  0600, all owned by 10001. Key content is never read or regenerated.
+- The server refuses to start as root, so adb cannot run as root again.
+- Startup logs `adb key ok`, `adb key missing` or `adb key unreadable`.
+- Pair and connect failures log a safe category (`key_unreadable`,
+  `connection_refused`, `protocol_fault`, `pairing_rejected`, `unknown`).
+  The pairing code is never logged.
+
 ## 0.3.11
 
 - The bearer token is no longer sufficient for any device action:

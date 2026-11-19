@@ -25,6 +25,34 @@ _SERIAL_RE = re.compile(r"\A[^\s]{1,128}\Z")
 class AdbError(RuntimeError):
     """An ADB operation failed. Messages are fixed; no device data leaks."""
 
+    def __init__(self, message, reason=None):
+        super().__init__(message)
+        self.reason = reason
+
+
+def classify_error(stderr: bytes) -> str:
+    """Map adb stderr to a safe category. Never returns raw output."""
+    text = (stderr or b"").decode("utf-8", "replace").lower()
+    if "adbkey" in text and "permission denied" in text:
+        return "key_unreadable"
+    if "protocol fault" in text:
+        return "protocol_fault"
+    if (
+        "connection refused" in text
+        or "cannot connect to" in text
+        or "failed to connect" in text
+        or "no route to host" in text
+    ):
+        return "connection_refused"
+    if (
+        "failed to authenticate" in text
+        or "rejected" in text
+        or "wrong password" in text
+        or "pairing failed" in text
+    ):
+        return "pairing_rejected"
+    return "unknown"
+
 
 def _host(value: str) -> str:
     """Only private LAN IPv4 literals are accepted."""
@@ -86,7 +114,7 @@ def _run(args, timeout=DEFAULT_TIMEOUT, stdin_data=None, max_bytes=MAX_OUTPUT_BY
 
     if len(out) > max_bytes:
         raise AdbError("output too large")
-    return process.returncode, out
+    return process.returncode, out, _err
 
 
 def pair(host: str, port: str, code: str, timeout: float = PAIR_TIMEOUT) -> None:
@@ -95,21 +123,21 @@ def pair(host: str, port: str, code: str, timeout: float = PAIR_TIMEOUT) -> None
     code = (code or "").strip()
     if not _CODE_RE.match(code):
         raise AdbError("invalid pairing code")
-    returncode, _out = _run(
+    returncode, _out, err = _run(
         ["pair", target],
         timeout=timeout,
         stdin_data=(code + "\n").encode("ascii"),
         max_bytes=65536,
     )
     if returncode != 0:
-        raise AdbError("pairing failed")
+        raise AdbError("pairing failed", classify_error(err))
 
 
 def connect(host: str, port: str, timeout: float = DEFAULT_TIMEOUT) -> None:
     target = "%s:%s" % (_host(host), _port(port))
-    returncode, out = _run(["connect", target], timeout=timeout, max_bytes=65536)
+    returncode, out, err = _run(["connect", target], timeout=timeout, max_bytes=65536)
     if returncode != 0 or b"connected" not in out.lower():
-        raise AdbError("connect failed")
+        raise AdbError("connect failed", classify_error(err) if returncode != 0 else "connection_refused")
 
 
 def validate_target(host: str, port: str, connect_port=None, code=None) -> None:
@@ -125,7 +153,7 @@ def validate_target(host: str, port: str, connect_port=None, code=None) -> None:
 def version(timeout: float = 5.0):
     """Return the adb version string, or None when adb is missing."""
     try:
-        returncode, out = _run(["version"], timeout=timeout, max_bytes=4096)
+        returncode, out, _err = _run(["version"], timeout=timeout, max_bytes=4096)
     except AdbError:
         return None
     if returncode != 0:
@@ -144,7 +172,7 @@ def disconnect(serial: str, timeout: float = 10.0) -> None:
 
 def list_devices(timeout: float = 10.0):
     """Return [{'serial': str, 'model': str}] for devices in state 'device'."""
-    returncode, out = _run(["devices", "-l"], timeout=timeout, max_bytes=65536)
+    returncode, out, _err = _run(["devices", "-l"], timeout=timeout, max_bytes=65536)
     if returncode != 0:
         raise AdbError("device list failed")
 
@@ -167,7 +195,7 @@ def list_devices(timeout: float = 10.0):
 
 def screencap(serial: str, timeout: float = DEFAULT_TIMEOUT):
     """Fixed capture command. No arguments come from the caller."""
-    returncode, out = _run(
+    returncode, out, _err = _run(
         ["-s", _serial(serial), "exec-out", "screencap", "-p"],
         timeout=timeout,
         max_bytes=MAX_OUTPUT_BYTES,
@@ -188,6 +216,6 @@ def run_input(args, timeout: float = 15.0):
         or args[4] not in ("tap", "swipe", "text")
     ):
         raise AdbError("rejected input command")
-    returncode, _out = _run(args, timeout=timeout, max_bytes=65536)
+    returncode, _out, _err = _run(args, timeout=timeout, max_bytes=65536)
     if returncode != 0:
         raise AdbError("input failed")

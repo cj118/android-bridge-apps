@@ -1101,5 +1101,28 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIn(b"viewing_session_closed", body)
 
 
+    def test_pair_with_unreadable_key_logs_safe_reason(self):
+        cookie, csrf = self.start_control()
+        key_dir = os.path.join(self.server.data_dir, ".android")
+        os.makedirs(key_dir, mode=0o700, exist_ok=True)
+        key = os.path.join(key_dir, "adbkey")
+        with open(key, "wb") as handle:
+            handle.write(b"key")
+        os.chmod(key, 0o644)
+        os.chown(key, os.geteuid(), os.getegid())
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, headers = self.ctl(
+                "/pair",
+                {"host": "192.168.1.50", "pairing_port": "37123",
+                 "code": "123456", "connect_port": "41234"},
+                cookie, csrf,
+            )
+        self.assertEqual(status, 303)
+        self.assertIn("flash=pair_failed", headers["Location"])
+        self.assertIn("pairing_failed reason=key_unreadable", capture.getvalue())
+        self.assertNotIn("123456", capture.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
