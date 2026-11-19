@@ -25,10 +25,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import adbctl
 import control as control_actions
+import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.19"
+VERSION = "0.3.20"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -56,7 +57,11 @@ MCP_ALLOWED_HOSTS = (
 )
 MCP_ALLOWLIST_TTL_SECONDS = 30.0
 UI_SESSION_TTL_SECONDS = 8 * 3600
-CONTROL_SESSION_TTL_SECONDS = 15 * 60
+CONTROL_MINUTES_DEFAULT = options_bridge.CONTROL_MINUTES_DEFAULT
+CONTROL_MINUTES_MIN = options_bridge.CONTROL_MINUTES_MIN
+CONTROL_MINUTES_MAX = options_bridge.CONTROL_MINUTES_MAX
+CONTROL_MINUTES_FILENAME = options_bridge.CONTROL_MINUTES_FILENAME
+CONTROL_SESSION_TTL_SECONDS = CONTROL_MINUTES_DEFAULT * 60
 PROPOSAL_COOLDOWN_SECONDS = 5.0
 # First live tap test: only one pending proposal. Set False for the 3 cap.
 FIRST_TAP_TEST_MODE = True
@@ -165,6 +170,10 @@ def device_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
 
 def tools_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
     return os.path.join(private_dir(data_dir), EXPOSE_TOOLS_FILENAME)
+
+
+def control_minutes_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
+    return os.path.join(private_dir(data_dir), CONTROL_MINUTES_FILENAME)
 
 
 def _ensure_private_dir(data_dir: str) -> str:
@@ -344,6 +353,36 @@ def load_exposed_tools(data_dir: str = DEFAULT_DATA_DIR):
         if name not in selected:
             selected.append(name)
     return tuple(selected)
+
+
+def load_control_minutes(data_dir: str = DEFAULT_DATA_DIR) -> int:
+    """Return the configured Control session length in minutes.
+
+    Only the private handoff written at startup is read. Missing, malformed,
+    loosely permissioned or out-of-range settings fall back to the default.
+    """
+    fallback = CONTROL_MINUTES_DEFAULT
+    path = control_minutes_path(data_dir)
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return fallback
+        if info.st_uid != os.geteuid():
+            return fallback
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            return fallback
+        with open(path, "rb") as handle:
+            data = json.loads(handle.read(65536))
+    except (OSError, ValueError):
+        return fallback
+    if not isinstance(data, dict):
+        return fallback
+    value = data.get("control_minutes")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return fallback
+    if not CONTROL_MINUTES_MIN <= value <= CONTROL_MINUTES_MAX:
+        return fallback
+    return value
 
 
 # --------------------------------------------------------------- device state
@@ -615,6 +654,17 @@ class Handler(BaseHTTPRequestHandler):
     def _control_open(self):
         with self.server.control_lock:
             return self._control_open_locked()
+
+    def _control_session_seconds(self):
+        """Validate the configured Control length; never trust a bad value."""
+        minutes = getattr(
+            self.server, "control_minutes", CONTROL_MINUTES_DEFAULT
+        )
+        if isinstance(minutes, bool) or not isinstance(minutes, int):
+            minutes = CONTROL_MINUTES_DEFAULT
+        if not CONTROL_MINUTES_MIN <= minutes <= CONTROL_MINUTES_MAX:
+            minutes = CONTROL_MINUTES_DEFAULT
+        return minutes * 60
 
     def _mcp_source_ok(self):
         """Only the TCP peer address counts. Forwarding headers are ignored."""
@@ -1646,7 +1696,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.control_active = ctl == "on"
                 if ctl == "on":
                     self.server.control_expires = (
-                        time.monotonic() + CONTROL_SESSION_TTL_SECONDS
+                        time.monotonic() + self._control_session_seconds()
                     )
                 else:
                     self.server.control_expires = 0.0
@@ -2025,6 +2075,10 @@ class Handler(BaseHTTPRequestHandler):
         now = time.monotonic()
         control_open = self._control_open()
         pending = self.server.approvals.pending()
+        auto_refresh = control_open or bool(pending)
+        refresh_html = (
+            "<meta http-equiv='refresh' content='5'>" if auto_refresh else ""
+        )
         cards = []
         for record in pending:
             image = base64.b64encode(record["preshot"]).decode("ascii")
@@ -2039,7 +2093,7 @@ class Handler(BaseHTTPRequestHandler):
             orientation = html.escape(
                 str(record.get("orientation", "")), quote=True
             )
-            remaining = max(0, int(record["expires"] - now))
+            remaining = control_actions.format_remaining(record["expires"] - now)
             tap_line = ""
             overlay = ""
             if action.get("type") == "tap":
@@ -2056,7 +2110,7 @@ class Handler(BaseHTTPRequestHandler):
                 "<h3>%s</h3>%s"
                 "<p><b>AI reason:</b> %s</p>"
                 "<p><b>Screen:</b> %d × %d — %s</p>"
-                "<p>Device: %s &middot; id %s &middot; expires in %ds</p>"
+                "<p>Device: %s &middot; id %s &middot; expires in %s</p>"
                 "<div style='position:relative;display:inline-block;"
                 "max-width:100%%;line-height:0'>"
                 "<img src='data:image/png;base64,%s' "
@@ -2114,7 +2168,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             saved_form = "<p>No saved tablet.</p>"
         body = (
-            "<html><body style='font-family:system-ui;max-width:60rem;margin:2rem auto'>"
+            "<html><head><meta charset='utf-8'>"
+            "<title>Android Bridge control</title>%s</head>"
+            "<body style='font-family:system-ui;max-width:60rem;margin:2rem auto'>"
             "<h1>Android Bridge control</h1>"
             "%s"
             "<p>Viewing session: <b>%s</b> &middot; Control session: <b>%s</b></p>"
@@ -2142,6 +2198,7 @@ class Handler(BaseHTTPRequestHandler):
             "<h2>Pending approvals</h2>%s"
             "<h2>Recent results</h2>%s</body></html>"
             % (
+                refresh_html,
                 flash_html,
                 viewing,
                 control,
@@ -2353,6 +2410,7 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.login_nonces = {}
     server.allowed_users = load_allowed_users(data_dir)
     server.exposed_tools = load_exposed_tools(data_dir)
+    server.control_minutes = load_control_minutes(data_dir)
     server.control_lock = threading.RLock()
     server.first_tap_test = FIRST_TAP_TEST_MODE
     server.approvals = control_actions.Approvals()

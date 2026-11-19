@@ -2,9 +2,10 @@
 
 /data/options.json is Supervisor-managed and is normally readable only by root.
 The application runs as uid 10001 and must not be given that file. This script
-runs once during container start, extracts ONLY `allowed_ha_users` and
-`expose_tools`, and writes them atomically into /data/private with mode 0600
-owned by the application user. No other option, credential or token is copied.
+runs once during container start, extracts ONLY `allowed_ha_users`,
+`expose_tools` and `control_minutes`, and writes them atomically into
+/data/private with mode 0600 owned by the application user. No other option,
+credential or token is copied.
 """
 
 from __future__ import annotations
@@ -15,6 +16,10 @@ import sys
 
 MAX_OPTIONS_BYTES = 64 * 1024
 TOOLS_FILENAME = "expose_tools.json"
+CONTROL_MINUTES_FILENAME = "control_minutes.json"
+CONTROL_MINUTES_DEFAULT = 60
+CONTROL_MINUTES_MIN = 5
+CONTROL_MINUTES_MAX = 240
 
 
 def _read_options(options_path: str):
@@ -52,6 +57,23 @@ def extract_tools(options_path: str):
     return values
 
 
+def extract_control_minutes(options_path: str):
+    """Return the Control session length in minutes.
+
+    Anything other than an integer inside the allowed range falls back to the
+    default. Booleans are rejected explicitly even though bool is an int.
+    """
+    data = _read_options(options_path)
+    if data is None:
+        return CONTROL_MINUTES_DEFAULT
+    value = data.get("control_minutes")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return CONTROL_MINUTES_DEFAULT
+    if not CONTROL_MINUTES_MIN <= value <= CONTROL_MINUTES_MAX:
+        return CONTROL_MINUTES_DEFAULT
+    return value
+
+
 def _write_private(target_path: str, payload: bytes, uid: int, gid: int) -> None:
     temporary = target_path + ".tmp"
     descriptor = os.open(
@@ -77,12 +99,23 @@ def write_tools_handoff(target_path: str, tools, uid: int, gid: int) -> None:
     _write_private(target_path, payload, uid, gid)
 
 
+def write_control_minutes_handoff(target_path: str, minutes: int, uid: int, gid: int) -> None:
+    payload = json.dumps({"control_minutes": minutes}, sort_keys=True).encode("utf-8")
+    _write_private(target_path, payload, uid, gid)
+
+
 def extract(options_path: str, target_path: str, uid: int, gid: int) -> int:
     users = extract_users(options_path)
     write_handoff(target_path, users, uid, gid)
     write_tools_handoff(
         os.path.join(os.path.dirname(target_path), TOOLS_FILENAME),
         extract_tools(options_path),
+        uid,
+        gid,
+    )
+    write_control_minutes_handoff(
+        os.path.join(os.path.dirname(target_path), CONTROL_MINUTES_FILENAME),
+        extract_control_minutes(options_path),
         uid,
         gid,
     )

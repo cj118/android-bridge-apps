@@ -171,6 +171,81 @@ class ToolHandoffTests(unittest.TestCase):
         )
 
 
+class ControlMinutesHandoffTests(unittest.TestCase):
+    """control_minutes crosses the root-only boundary in its own 0600 file."""
+
+    def setUp(self):
+        self.data_dir = tempfile.mkdtemp(prefix="bridge-opt-minutes-")
+        os.makedirs(bridge.private_dir(self.data_dir), mode=0o700)
+        self.options = os.path.join(self.data_dir, "options.json")
+        self.target = os.path.join(
+            bridge.private_dir(self.data_dir), "allowed_users.json"
+        )
+
+    def write_options(self, payload):
+        with open(self.options, "w", encoding="utf-8") as handle:
+            if isinstance(payload, str):
+                handle.write(payload)
+            else:
+                json.dump(payload, handle)
+        os.chmod(self.options, 0o600)
+
+    def extract(self, payload):
+        self.write_options(payload)
+        options_bridge.extract(
+            self.options, self.target, os.geteuid(), os.getegid()
+        )
+
+    def read_handoff(self):
+        with open(
+            os.path.join(
+                bridge.private_dir(self.data_dir), "control_minutes.json"
+            ),
+            encoding="utf-8",
+        ) as handle:
+            return json.load(handle)
+
+    def test_missing_option_defaults_to_sixty(self):
+        self.extract({"allowed_ha_users": ["carlj"]})
+        self.assertEqual(self.read_handoff(), {"control_minutes": 60})
+        self.assertEqual(bridge.load_control_minutes(self.data_dir), 60)
+
+    def test_minimum_is_accepted(self):
+        self.extract({"control_minutes": 5})
+        self.assertEqual(self.read_handoff(), {"control_minutes": 5})
+        self.assertEqual(bridge.load_control_minutes(self.data_dir), 5)
+
+    def test_maximum_is_accepted(self):
+        self.extract({"control_minutes": 240})
+        self.assertEqual(self.read_handoff(), {"control_minutes": 240})
+        self.assertEqual(bridge.load_control_minutes(self.data_dir), 240)
+
+    def test_invalid_values_fall_back_to_sixty(self):
+        for value in (0, 4, 241, -1, 1000, "60", 60.0, True, None, [60]):
+            with self.subTest(value=value):
+                self.extract({"control_minutes": value})
+                self.assertEqual(self.read_handoff(), {"control_minutes": 60})
+                self.assertEqual(bridge.load_control_minutes(self.data_dir), 60)
+
+    def test_handoff_is_private(self):
+        self.extract({"control_minutes": 90})
+        path = os.path.join(
+            bridge.private_dir(self.data_dir), "control_minutes.json"
+        )
+        info = os.lstat(path)
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+        self.assertEqual(info.st_uid, os.geteuid())
+
+    def test_loose_handoff_is_rejected(self):
+        self.extract({"control_minutes": 90})
+        path = os.path.join(
+            bridge.private_dir(self.data_dir), "control_minutes.json"
+        )
+        os.chmod(path, 0o644)
+        self.assertEqual(bridge.load_control_minutes(self.data_dir), 60)
+
+
 class AllowlistSignInTests(unittest.TestCase):
     """End-to-end: carlj from the handoff can sign in; others cannot."""
 

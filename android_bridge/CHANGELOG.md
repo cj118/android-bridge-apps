@@ -1,5 +1,24 @@
 # Android Bridge changelog
 
+## 0.3.20
+
+- New add-on option `control_minutes` (integer, default 60, allowed 5–240)
+  sets the Control session length. Out-of-range or malformed values fail back
+  to 60 minutes. Expiry still turns Control off, clears pending approvals and
+  increments the safety epoch; STOP is unchanged.
+- Tap approval lifetime is now 600 seconds (10 minutes), up from 120. The
+  fresh-screenshot and target-area comparison at approval is unchanged, so a
+  stale screen is still refused.
+- The Control page auto-refreshes every 5 seconds while Control is ON or at
+  least one approval is pending, so new TAP cards appear without a manual
+  pull-down. Refresh stops when Control is off and nothing is pending. It
+  never approves, rejects or executes anything by itself.
+- Pending approval cards show the remaining time in minutes and seconds
+  (for example `9m 58s`) instead of a bare second count.
+- Security behaviour is unchanged: Home Assistant user sign-in, CSRF and
+  Origin checks, Viewing, hardware serial verification, the screen-change
+  check, single-use approvals, STOP and `expose_tools` all behave as before.
+
 ## 0.3.19
 
 - `android_tap` now requires a non-empty human-readable `reason` of at most

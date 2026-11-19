@@ -244,6 +244,7 @@ class ControlSecurityTests(unittest.TestCase):
         with open(self.screen_counter, "w") as handle:
             handle.write("0")
         self.server.last_proposal_at = 0.0
+        self.server.control_minutes = bridge.CONTROL_MINUTES_DEFAULT
         bridge.save_device(self.data_dir, "192.168.1.50", "41234")
         open(self.log_path, "w").close()
 
@@ -1993,12 +1994,80 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIn("data:image/png;base64,", text)
 
 
-    def test_control_ttl_is_fifteen_minutes(self):
-        self.assertEqual(bridge.CONTROL_SESSION_TTL_SECONDS, 15 * 60)
+    def test_control_ttl_defaults_to_sixty_minutes(self):
+        self.assertEqual(bridge.CONTROL_SESSION_TTL_SECONDS, 60 * 60)
         self.start_control()
         self.assertGreater(
-            self.server.control_expires, time.monotonic() + 14 * 60
+            self.server.control_expires, time.monotonic() + 59 * 60
         )
+
+    def test_control_minutes_option_sets_session_length(self):
+        for minutes in (5, 240):
+            with self.subTest(minutes=minutes):
+                self.server.control_minutes = minutes
+                self.start_control()
+                remaining = self.server.control_expires - time.monotonic()
+                self.assertGreater(remaining, minutes * 60 - 5)
+                self.assertLessEqual(remaining, minutes * 60)
+
+    def test_invalid_control_minutes_falls_back_to_default(self):
+        for value in (0, 4, 241, 9999, True, "60", None):
+            with self.subTest(value=value):
+                self.server.control_minutes = value
+                self.start_control()
+                remaining = self.server.control_expires - time.monotonic()
+                self.assertGreater(remaining, 59 * 60)
+                self.assertLessEqual(remaining, 60 * 60)
+
+    def test_approval_expiry_is_ten_minutes(self):
+        self.assertEqual(control_actions.APPROVAL_TTL_SECONDS, 600.0)
+        self.start_control()
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "ten minutes"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["expires_in_seconds"], 600)
+        record = self.server.approvals.get(summary["approval_id"])
+        remaining = record["expires"] - time.monotonic()
+        self.assertGreater(remaining, 599)
+        self.assertLessEqual(remaining, 600)
+
+    def test_remaining_time_is_shown_in_minutes_and_seconds(self):
+        self.assertEqual(control_actions.format_remaining(600), "10m 00s")
+        self.assertEqual(control_actions.format_remaining(125), "2m 05s")
+        self.assertEqual(control_actions.format_remaining(59), "0m 59s")
+        self.assertEqual(control_actions.format_remaining(-1), "0m 00s")
+        cookie, _csrf = self.start_control()
+        self.new_proposal()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertRegex(
+            page.decode("utf-8"), r"expires in 9m 5[0-9]s"
+        )
+
+    def test_panel_auto_refreshes_only_for_control_or_pending(self):
+        cookie, _csrf = self.login()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertNotIn("http-equiv='refresh'", page.decode("utf-8"))
+
+        self.start_control()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(
+            "<meta http-equiv='refresh' content='5'>", page.decode("utf-8")
+        )
+
+        self.new_proposal()
+        # Control off while one approval is still pending: keep refreshing so
+        # the card can be seen and acted on, but never approve anything.
+        self.server.control_active = False
+        self.server.control_expires = 0.0
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn("<meta http-equiv='refresh' content='5'>", text)
+        self.assertIn("Approve", text)
 
     def test_crosshair_math_is_percentage_based(self):
         for x, y, width, height, expected in (

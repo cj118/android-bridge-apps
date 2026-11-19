@@ -18,9 +18,17 @@ MAX_SWIPE_MS = 5000
 MIN_SWIPE_MS = 50
 MAX_TEXT_LEN = 200
 MAX_REASON_LEN = 200
-APPROVAL_TTL_SECONDS = 120.0
+# 10 minutes: long enough to read the screenshot calmly without leaving an
+# approval usable for an unbounded time.
+APPROVAL_TTL_SECONDS = 600.0
 MAX_PENDING = 3
 _TEXT_RE = re.compile(r"\A[A-Za-z0-9 .,!?@#_+:\-]{1,%d}\Z" % MAX_TEXT_LEN)
+
+
+def format_remaining(seconds):
+    """Format a TTL as minutes and seconds, never negative."""
+    total = max(0, int(seconds))
+    return "%dm %02ds" % (total // 60, total % 60)
 
 
 class ActionError(ValueError):
