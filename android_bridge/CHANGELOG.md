@@ -1,5 +1,15 @@
 # Android Bridge changelog
 
+## 0.3.13
+
+- Every MCP request now requires both the allowlisted OpenCode source address and
+  an open Viewing session. A valid bearer token no longer bypasses either; the
+  token is not consulted on `/mcp` at all.
+- Viewing sessions carry an expiry (8 hours) and are cleared by STOP and by
+  disconnect, so screenshots, action proposals and post-action images stop
+  immediately.
+- `/screenshot` uses the same viewing predicate as `/mcp`.
+
 ## 0.3.12
 
 - Fix: an earlier adb run as root left `/data/.android/adbkey` owned by root, so

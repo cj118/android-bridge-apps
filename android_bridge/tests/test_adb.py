@@ -117,9 +117,15 @@ class ScreenshotTests(unittest.TestCase):
         cls.server.server_close()
 
     def setUp(self):
+        self._orig_source = bridge.mcp_source_allowed
+        bridge.mcp_source_allowed = lambda address: True
         self.server.capture_times.clear()
         self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 3600
         os.environ["FAKE_ADB_MODE"] = "ok"
+
+    def tearDown(self):
+        bridge.mcp_source_allowed = self._orig_source
 
     def auth(self):
         return {"Authorization": "Bearer " + self.token}
@@ -228,11 +234,15 @@ class ScreenshotTests(unittest.TestCase):
         status, data, _ = self.request("POST", "/mcp", headers, body)
         return status, (json.loads(data) if data else None)
 
-    def test_mcp_requires_auth(self):
+    def test_mcp_rejects_an_unknown_source(self):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
-        status, _, _ = self.request(
-            "POST", "/mcp", {"Content-Type": "application/json"}, body
-        )
+        original = self._with_allowlist(False)
+        try:
+            status, _, _ = self.request(
+                "POST", "/mcp", {"Content-Type": "application/json"}, body
+            )
+        finally:
+            self._restore_allowlist(original)
         self.assertEqual(status, 401)
 
     def test_mcp_initialize_and_tools_list(self):
@@ -276,18 +286,17 @@ class ScreenshotTests(unittest.TestCase):
         )
         return status, (json.loads(data) if data else None)
 
-    def _with_allowlist(self, ips):
-        original = bridge._resolve_host_ips
-        bridge._resolve_host_ips = lambda host: set(ips)
-        bridge.refresh_mcp_allowlist(force=True)
+    def _with_allowlist(self, allowed):
+        original = bridge.mcp_source_allowed
+        bridge.mcp_source_allowed = lambda address: bool(allowed)
         return original
 
     def _restore_allowlist(self, original):
-        bridge._resolve_host_ips = original
-        bridge.refresh_mcp_allowlist(force=True)
+        bridge.mcp_source_allowed = original
 
     def _open_window(self):
         self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 3600
         return 200, b"", {}
 
     def _close_window(self):
@@ -321,8 +330,8 @@ class ScreenshotTests(unittest.TestCase):
             self._restore_allowlist(original)
         self.assertEqual(status, 401)
 
-    def test_mcp_invalid_token_rejected_even_when_allowlisted(self):
-        original = self._with_allowlist({"127.0.0.1"})
+    def test_mcp_ignores_an_invalid_bearer_for_allowlisted_peer(self):
+        original = self._with_allowlist(True)
         try:
             status, _, _ = self.request(
                 "POST", "/mcp",
@@ -332,7 +341,7 @@ class ScreenshotTests(unittest.TestCase):
             )
         finally:
             self._restore_allowlist(original)
-        self.assertEqual(status, 401)
+        self.assertEqual(status, 200)
 
 
     def test_mcp_without_window_is_403(self):
@@ -389,6 +398,97 @@ class ScreenshotTests(unittest.TestCase):
         with contextlib.redirect_stderr(capture):
             bridge._log_adb_version()
         self.assertIn("adb available version=1.0.41", capture.getvalue())
+
+
+    # ---------- gate: source AND viewing, never a bearer ----------
+
+    def screenshot_call(self, headers=None):
+        return self.request(
+            "POST", "/mcp",
+            {"Content-Type": "application/json", **(headers or {})},
+            json.dumps({"jsonrpc": "2.0", "id": 30, "method": "tools/call",
+                        "params": {"name": "android_screenshot",
+                                   "arguments": {}}}).encode(),
+        )
+
+    def test_allowed_peer_viewing_on_can_screenshot_without_token(self):
+        original = self._with_allowlist(True)
+        try:
+            self.server.viewing_active = True
+            self.server.viewing_expires = time.monotonic() + 3600
+            status, data, _ = self.screenshot_call()
+        finally:
+            self._restore_allowlist(original)
+        self.assertEqual(status, 200)
+        payload = json.loads(data)
+        self.assertEqual(payload["result"]["content"][0]["type"], "image")
+
+    def test_viewing_off_denies_even_with_a_valid_bearer(self):
+        original = self._with_allowlist(True)
+        try:
+            self.server.viewing_active = False
+            status, data, _ = self.screenshot_call(self.auth())
+        finally:
+            self._restore_allowlist(original)
+        self.assertEqual(status, 403)
+        self.assertNotIn(b'"result"', data)
+        self.assertNotIn(b'"data"', data)
+
+    def test_unknown_peer_denied_even_with_a_valid_bearer(self):
+        original = self._with_allowlist(False)
+        try:
+            self.server.viewing_active = True
+            self.server.viewing_expires = time.monotonic() + 3600
+            status, data, _ = self.screenshot_call(self.auth())
+        finally:
+            self._restore_allowlist(original)
+        self.assertEqual(status, 401)
+        self.assertNotIn(b'"result"', data)
+
+    def test_expired_viewing_denies_even_with_a_valid_bearer(self):
+        original = self._with_allowlist(True)
+        try:
+            self.server.viewing_active = True
+            self.server.viewing_expires = time.monotonic() + 3600
+            self.server.viewing_expires = time.monotonic() - 1.0
+            status, data, _ = self.screenshot_call(self.auth())
+        finally:
+            self._restore_allowlist(original)
+        self.assertEqual(status, 403)
+        self.assertNotIn(b'"result"', data)
+
+
+    def test_zero_expiry_is_closed(self):
+        original = self._with_allowlist(True)
+        try:
+            self.server.viewing_active = True
+            self.server.viewing_expires = 0.0
+            status, data, _ = self.screenshot_call(self.auth())
+        finally:
+            self._restore_allowlist(original)
+        self.assertEqual(status, 403)
+        self.assertNotIn(b'"result"', data)
+
+    def test_missing_expiry_is_closed(self):
+        original = self._with_allowlist(True)
+        try:
+            self.server.viewing_active = True
+            if hasattr(self.server, "viewing_expires"):
+                del self.server.viewing_expires
+            status, data, _ = self.screenshot_call()
+        finally:
+            self._restore_allowlist(original)
+        self.assertEqual(status, 403)
+
+    def test_invalid_expiry_is_closed(self):
+        original = self._with_allowlist(True)
+        try:
+            self.server.viewing_active = True
+            self.server.viewing_expires = "not-a-number"
+            status, data, _ = self.screenshot_call(self.auth())
+        finally:
+            self._restore_allowlist(original)
+        self.assertEqual(status, 403)
 
 
 if __name__ == "__main__":

@@ -96,9 +96,12 @@ class ControlSecurityTests(unittest.TestCase):
 
     def tearDown(self):
         bridge.Handler._peer = self._orig_peer
+        bridge.mcp_source_allowed = self._orig_mcp_source
 
     def setUp(self):
         self._orig_peer = bridge.Handler._peer
+        self._orig_mcp_source = bridge.mcp_source_allowed
+        bridge.mcp_source_allowed = lambda address: True
         self.server.allowed_users = frozenset({"alice"})
         self.set_peer("172.30.32.2")
         self.server.viewing_active = False
@@ -216,6 +219,8 @@ class ControlSecurityTests(unittest.TestCase):
     # ---------- proposal ----------
 
     def test_proposal_requires_control_session(self):
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 3600
         _, payload = self.propose("android_tap", {"x": 10, "y": 20})
         self.assertTrue(payload["result"]["isError"])
         self.assertEqual(payload["result"]["content"][0]["text"], "control_session_inactive")
@@ -508,8 +513,15 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIsNone(self.server.approvals.get(key))
         status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
         self.assertEqual(status, 303)
-        _, payload = self.propose("android_tap", {"x": 13, "y": 14})
-        self.assertEqual(payload["result"]["content"][0]["text"], "control_session_inactive")
+        status, payload, _ = self.req(
+            "POST", "/mcp",
+            {"Content-Type": "application/json"},
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": "android_tap",
+                                   "arguments": {"x": 13, "y": 14}}}).encode(),
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn(b"result", payload)
 
     def test_text_metacharacters_rejected(self):
         self.start_control()
@@ -1122,6 +1134,39 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIn("flash=pair_failed", headers["Location"])
         self.assertIn("pairing_failed reason=key_unreadable", capture.getvalue())
         self.assertNotIn("123456", capture.getvalue())
+
+
+    def test_stop_denies_mcp_even_with_a_valid_bearer(self):
+        cookie, csrf = self.start_control()
+        status, _, _ = self.ctl("/control/stop", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        status, body, _ = self.req(
+            "POST", "/mcp",
+            {"Content-Type": "application/json",
+             "Authorization": "Bearer " + self.token},
+            json.dumps({"jsonrpc": "2.0", "id": 40, "method": "tools/call",
+                        "params": {"name": "android_screenshot",
+                                   "arguments": {}}}).encode(),
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn(b'"result"', body)
+
+
+    def test_panel_shows_expired_viewing_as_off(self):
+        cookie, _csrf = self.login()
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() - 1
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Viewing session: <b>off</b>", page)
+
+    def test_panel_shows_active_viewing_as_on(self):
+        cookie, _csrf = self.login()
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 60
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Viewing session: <b>ON</b>", page)
 
 
 if __name__ == "__main__":

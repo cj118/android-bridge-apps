@@ -27,7 +27,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.12"
+VERSION = "0.3.13"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -456,14 +456,26 @@ class Handler(BaseHTTPRequestHandler):
         hmac.compare_digest(_DUMMY_TOKEN, self.server.token)
         return False
 
+    def _viewing_open(self):
+        """Fail closed: a missing, zero, invalid or past expiry is not open."""
+        if not self.server.viewing_active:
+            return False
+        try:
+            expires = float(getattr(self.server, "viewing_expires", 0.0))
+        except (TypeError, ValueError):
+            return False
+        if expires <= 0.0:
+            return False
+        return time.monotonic() < expires
+
     def _mcp_gate(self):
-        """Return (allowed, error). Bearer wins; otherwise address AND window."""
-        values = self.headers.get_all("Authorization") or []
-        if values:
-            return self._authorized(), "unauthorized"
+        """Source allowlist AND an open Viewing session, whatever the headers say.
+
+        A bearer token is never accepted as a substitute for either control.
+        """
         if not mcp_source_allowed(self.client_address[0]):
             return False, "unauthorized"
-        if not self.server.viewing_active:
+        if not self._viewing_open():
             return False, "viewing_session_closed"
         return True, None
 
@@ -583,7 +595,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/screenshot":
             if not self._require_auth():
                 return
-            if not self.server.viewing_active:
+            if not self._viewing_open():
                 self._send_json(403, {"error": "viewing_session_closed"})
                 return
             self._handle_screenshot()
@@ -1050,6 +1062,9 @@ class Handler(BaseHTTPRequestHandler):
         minutes = (fields.get("minutes") or "").strip()
         stop = action == "stop" or minutes == "0"
         self.server.viewing_active = not stop
+        self.server.viewing_expires = (
+            0.0 if stop else time.monotonic() + UI_SESSION_TTL_SECONDS
+        )
         self._send_json(200, {"viewing": "active" if self.server.viewing_active else "stopped"})
 
     # ---------- human control surface ----------
@@ -1360,6 +1375,9 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.control_lock:
             if view in ("on", "off"):
                 self.server.viewing_active = view == "on"
+                self.server.viewing_expires = (
+                    time.monotonic() + UI_SESSION_TTL_SECONDS if view == "on" else 0.0
+                )
             if ctl in ("on", "off"):
                 self.server.control_active = ctl == "on"
                 if ctl == "off":
@@ -1459,12 +1477,14 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.control_lock:
             self.server.control_active = False
             self.server.viewing_active = False
+            self.server.viewing_expires = 0.0
             self.server.approvals.clear()
         self._respond({"control": False, "pending": 0}, flash="stopped")
 
     def _end_sessions(self):
         with self.server.control_lock:
             self.server.viewing_active = False
+            self.server.viewing_expires = 0.0
             self.server.control_active = False
             self.server.approvals.clear()
 
@@ -1571,7 +1591,8 @@ class Handler(BaseHTTPRequestHandler):
                     record["id"],
                 )
             )
-        viewing = "ON" if self.server.viewing_active else "off"
+        viewing_open = self._viewing_open()
+        viewing = "ON" if viewing_open else "off"
         control = "ON" if self.server.control_active else "off"
         body = (
             "<html><body style='font-family:system-ui;max-width:60rem;margin:2rem auto'>"
@@ -1603,8 +1624,8 @@ class Handler(BaseHTTPRequestHandler):
                 viewing,
                 control,
                 csrf,
-                "off" if self.server.viewing_active else "on",
-                "ON" if self.server.viewing_active else "start",
+                "off" if viewing_open else "on",
+                "ON" if viewing_open else "start",
                 "off" if self.server.control_active else "on",
                 "ON" if self.server.control_active else "start",
                 csrf,
@@ -1726,6 +1747,7 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.capture_lock = threading.Lock()
     server.capture_times = []
     server.viewing_active = False
+    server.viewing_expires = 0.0
     server.control_active = False
     server.ui_sessions = {}
     server.login_nonces = {}
