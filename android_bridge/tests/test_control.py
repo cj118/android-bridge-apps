@@ -111,8 +111,12 @@ class ControlSecurityTests(unittest.TestCase):
 
     ORIGIN = "https://ha.example"
 
-    def login(self, origin=ORIGIN):
-        extra = {"Origin": origin} if origin else {}
+    def login(self, origin=ORIGIN, sfs=None):
+        extra = {}
+        if origin is not False:
+            extra["Origin"] = origin
+        if sfs:
+            extra["Sec-Fetch-Site"] = sfs
         status, _, headers = self.form("/control", {"token": self.token}, extra)
         self.assertEqual(status, 200)
         cookie = {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
@@ -121,13 +125,19 @@ class ControlSecurityTests(unittest.TestCase):
         csrf = re.search(rb"name='csrf' value='([0-9a-f]+)'", page).group(1).decode()
         return cookie, csrf
 
-    def ctl(self, path, data, cookie, csrf, origin=None):
+    def ctl(self, path, data, cookie, csrf, origin=None, sfs=None):
         payload = dict(data)
         payload["csrf"] = csrf
         headers = dict(cookie)
         if origin is not False:
             headers["Origin"] = self.ORIGIN if origin is None else origin
+        if sfs:
+            headers["Sec-Fetch-Site"] = sfs
         return self.form(path, payload, headers)
+
+    def login_null(self):
+        """Session created from an opaque (null) origin, as the ingress does."""
+        return self.login(origin="null", sfs="same-origin")
 
     def start_control(self):
         cookie, csrf = self.login()
@@ -293,27 +303,104 @@ class ControlSecurityTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
-    def test_session_without_bound_origin_rejects_any_origin(self):
-        cookie, csrf = self.login(origin=None)
+    def test_session_without_bound_origin_rejects_a_real_origin(self):
+        cookie, csrf = self.login_null()
         self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf,
-                 origin=False)
+                 origin="null", sfs="same-origin")
         key = self.new_proposal()
         status, _, _ = self.form(
             "/control/approve", {"id": key, "csrf": csrf},
-            {**cookie, "Origin": "https://ha.example"},
+            {**cookie, "Origin": "https://ha.example",
+             "Sec-Fetch-Site": "same-origin"},
         )
         self.assertEqual(status, 403)
 
-    def test_session_without_bound_origin_accepts_no_origin(self):
-        cookie, csrf = self.login(origin=None)
-        self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf,
-                 origin=False)
+    # ---------- opaque origin (live ingress behaviour) ----------
+
+    def test_null_origin_with_same_origin_is_accepted(self):
+        cookie, csrf = self.login_null()
+        status, _, _ = self.ctl(
+            "/control/session", {"view": "on", "control": "on"},
+            cookie, csrf, origin="null", sfs="same-origin",
+        )
+        self.assertEqual(status, 200)
         key = self.new_proposal()
-        status, _, _ = self.form(
-            "/control/approve", {"id": key, "csrf": csrf}, cookie
+        status, _, _ = self.ctl(
+            "/control/approve", {"id": key}, cookie, csrf,
+            origin="null", sfs="same-origin",
         )
         self.assertEqual(status, 200)
         self.assertIn("'input'", self.adb_log())
+
+    def test_null_origin_with_cross_site_is_rejected(self):
+        cookie, csrf = self.login_null()
+        self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf,
+                 origin="null", sfs="same-origin")
+        key = self.new_proposal()
+        status, _, _ = self.ctl(
+            "/control/approve", {"id": key}, cookie, csrf,
+            origin="null", sfs="cross-site",
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_null_origin_with_same_site_is_rejected(self):
+        cookie, csrf = self.login_null()
+        self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf,
+                 origin="null", sfs="same-origin")
+        key = self.new_proposal()
+        status, _, _ = self.ctl(
+            "/control/approve", {"id": key}, cookie, csrf,
+            origin="null", sfs="same-site",
+        )
+        self.assertEqual(status, 403)
+
+    def test_null_origin_without_fetch_metadata_is_rejected(self):
+        cookie, csrf = self.login_null()
+        self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf,
+                 origin="null", sfs="same-origin")
+        key = self.new_proposal()
+        status, _, _ = self.ctl(
+            "/control/approve", {"id": key}, cookie, csrf, origin="null",
+        )
+        self.assertEqual(status, 403)
+
+    def test_null_origin_without_csrf_is_rejected(self):
+        cookie, csrf = self.login_null()
+        self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf,
+                 origin="null", sfs="same-origin")
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key},
+            {**cookie, "Origin": "null", "Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_null_origin_without_session_is_rejected(self):
+        status, _, _ = self.form(
+            "/control/approve", {"id": "deadbeef", "csrf": "0" * 32},
+            {"Origin": "null", "Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(status, 403)
+
+    def test_signin_with_null_origin_requires_fetch_metadata(self):
+        status, _, headers = self.form(
+            "/control", {"token": self.token}, {"Origin": "null"}
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_rejection_log_includes_fetch_site(self):
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            self.form(
+                "/control/approve", {"id": "x"},
+                {"Origin": "null", "Sec-Fetch-Site": "cross-site"},
+            )
+        output = capture.getvalue()
+        self.assertIn("control_forbidden reason=", output)
+        self.assertIn("sfs=cross-site", output)
 
     def test_ingress_forwarded_host_is_accepted(self):
         cookie, csrf = self.start_control()

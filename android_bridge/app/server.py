@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -1036,31 +1036,45 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return "%s://%s" % (parsed.scheme, parsed.netloc.lower())
 
-    def _origin_error(self, nonce):
-        """Cross-site rejection bound to the origin that created the session.
+    @staticmethod
+    def _log_site(value):
+        """Reduce Sec-Fetch-Site to a fixed vocabulary before logging."""
+        if not value:
+            return "missing"
+        value = value.strip().lower()
+        if value in ("same-origin", "same-site", "cross-site", "none"):
+            return value
+        return "other"
 
-        Host and X-Forwarded-Host are rewritten by the Home Assistant ingress and
-        by any upstream proxy, so they are not trust anchors. The browser Origin
-        captured at sign-in is. Sec-Fetch-Site, when the browser sends it, is
-        authoritative and overrides nothing else.
+    def _origin_error(self, nonce):
+        """Cross-site rejection for control actions.
+
+        Host and X-Forwarded-Host are rewritten by the Home Assistant ingress
+        and by upstream proxies, so they are not trust anchors. Two things are:
+        the origin captured when the session was created, and the browser's own
+        Sec-Fetch-Site. An opaque or absent Origin is accepted only when the
+        browser states same-origin.
         """
         site = self.headers.get("Sec-Fetch-Site")
-        if site in ("same-origin", "none"):
-            return None
-        if site == "cross-site":
-            return "cross_site"
-
         raw = self.headers.get("Origin")
         presented = self._normalise_origin(raw)
-        if raw is not None and presented is None:
-            if raw.strip().lower() == "null":
-                return "origin_null"
+
+        if raw is not None and presented is None and raw.strip().lower() != "null":
             return "origin_invalid"
+
+        if raw is None or presented is None:
+            # Missing or "null": fetch metadata is the only proof available.
+            if site == "same-origin":
+                return None
+            return "origin_null"
+
+        if site == "cross-site":
+            return "cross_site"
 
         session = self.server.ui_sessions.get(nonce) or {}
         bound = session.get("origin")
         if bound is None:
-            return None if presented is None else "origin_unbound"
+            return "origin_unbound"
         if presented != bound:
             return "origin_mismatch"
         return None
@@ -1079,8 +1093,18 @@ class Handler(BaseHTTPRequestHandler):
     def _do_login(self, fields):
         if not self._require_auth(fields.get("token")):
             return
+        raw_origin = self.headers.get("Origin")
+        bound_origin = self._normalise_origin(raw_origin)
+        site = self.headers.get("Sec-Fetch-Site")
+        if bound_origin is None and site != "same-origin":
+            sys.stderr.write(
+                "login_forbidden reason=origin_null sfs=%s\n" % self._log_site(site)
+            )
+            time.sleep(AUTH_FAIL_DELAY_SECONDS)
+            self._send_json(403, {"error": "forbidden"})
+            return
+
         nonce = secrets.token_hex(16)
-        bound_origin = self._normalise_origin(self.headers.get("Origin"))
         csrf = hmac.new(
             self.server.token, (nonce + ":csrf").encode("ascii"), "sha256"
         ).hexdigest()[:32]
@@ -1126,7 +1150,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _control_denied(self, reason):
         """Log which guard rejected the request. Never logs header values."""
-        sys.stderr.write("control_forbidden reason=%s\n" % reason)
+        sys.stderr.write(
+            "control_forbidden reason=%s sfs=%s\n"
+            % (reason, self._log_site(self.headers.get("Sec-Fetch-Site")))
+        )
         time.sleep(AUTH_FAIL_DELAY_SECONDS)
         self._send_json(403, {"error": "forbidden"})
 
