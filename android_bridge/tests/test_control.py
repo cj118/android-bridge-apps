@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+from html.parser import HTMLParser
 from http.client import HTTPConnection
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -67,6 +68,50 @@ sys.exit(7)
 def make_png(w=1920, h=1200):
     return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
             + struct.pack(">II", w, h) + b"\x00" * 9)
+
+
+class RenderedPage(HTMLParser):
+    """Record the visible text, tags and POST form fields of real HTML."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text = []
+        self.tags = []
+        self.forms = []
+        self.form_starts = 0
+        self.form_ends = 0
+        self.attribute_values = []
+        self._open_forms = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        self.tags.append(tag)
+        self.attribute_values.extend(
+            value for value in attrs.values() if value is not None
+        )
+        if tag == "form":
+            self.form_starts += 1
+            form = {"attrs": attrs, "inputs": []}
+            self.forms.append(form)
+            self._open_forms.append(form)
+        elif tag == "input" and self._open_forms:
+            self._open_forms[-1]["inputs"].append(attrs)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.form_ends += 1
+            if self._open_forms:
+                self._open_forms.pop()
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+    @property
+    def visible_text(self):
+        return "".join(self.text)
 
 
 class ControlSecurityTests(unittest.TestCase):
@@ -1298,6 +1343,100 @@ class ControlSecurityTests(unittest.TestCase):
         status, page, _ = self.req("GET", "/control", cookie)
         self.assertEqual(status, 200)
         self.assertIn(b"Viewing session: <b>ON</b>", page)
+
+
+    # ---------- control page markup ----------
+
+    def render_control_page(self):
+        cookie, csrf = self.login()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        parser = RenderedPage()
+        parser.feed(page.decode("utf-8"))
+        parser.close()
+        return cookie, csrf, page, parser
+
+    def test_control_page_never_shows_the_csrf_token_as_text(self):
+        _cookie, csrf, _page, parser = self.render_control_page()
+        self.assertTrue(csrf)
+        self.assertNotIn(csrf, parser.visible_text)
+        # The token is allowed in attributes, never inside injected markup.
+        for value in parser.attribute_values:
+            self.assertNotIn("<form", value)
+            self.assertNotIn("<input", value)
+
+    def test_every_post_form_has_exactly_one_hidden_csrf_field(self):
+        _cookie, csrf, _page, parser = self.render_control_page()
+        post_forms = [
+            form for form in parser.forms
+            if form["attrs"].get("method", "").lower() == "post"
+        ]
+        self.assertTrue(post_forms)
+        actions = [form["attrs"].get("action", "") for form in post_forms]
+        self.assertIn("pair", actions)
+        self.assertIn("control/reconnect", actions)
+        self.assertIn("control/session", actions)
+        self.assertIn("control/stop", actions)
+        self.assertIn("disconnect", actions)
+        for form in post_forms:
+            hidden = [
+                field for field in form["inputs"]
+                if field.get("type", "").lower() == "hidden"
+                and field.get("name") == "csrf"
+            ]
+            self.assertEqual(
+                len(hidden), 1, "form %r" % form["attrs"].get("action")
+            )
+            self.assertEqual(hidden[0].get("value"), csrf)
+
+    def test_control_page_has_no_stray_quote_or_broken_tags(self):
+        _cookie, _csrf, _page, parser = self.render_control_page()
+        text = parser.visible_text
+        self.assertNotIn("'>", text)
+        self.assertNotIn('">', text)
+        self.assertNotIn("<form", text)
+        self.assertNotIn("</form", text)
+        self.assertNotIn("<input", text)
+        self.assertEqual(parser.form_starts, parser.form_ends)
+        self.assertEqual(parser.form_starts, len(parser.forms))
+
+    def test_reconnect_form_escapes_saved_host_and_port(self):
+        bridge.save_device(
+            self.data_dir,
+            "10.0.0.1'><script>alert(1)</script>",
+            "41'234",
+        )
+        _cookie, _csrf, page, parser = self.render_control_page()
+        self.assertNotIn("script", parser.tags)
+        self.assertIn(
+            b"10.0.0.1&#x27;&gt;&lt;script&gt;alert(1)&lt;/script&gt;", page
+        )
+        self.assertIn(b"41&#x27;234", page)
+
+    def test_parsed_reconnect_form_submits_successfully(self):
+        cookie, csrf, _page, parser = self.render_control_page()
+        forms = [
+            form for form in parser.forms
+            if form["attrs"].get("action", "").endswith("control/reconnect")
+        ]
+        self.assertEqual(len(forms), 1)
+        form = forms[0]
+        data = {}
+        for field in form["inputs"]:
+            name = field.get("name")
+            if name:
+                data[name] = field.get("value", "")
+        # Only fields actually present in the rendered HTML are submitted.
+        self.assertEqual(data, {"csrf": csrf})
+        path = urllib.parse.urljoin("/control", form["attrs"]["action"])
+        status, _, headers = self.form(path, data, headers=dict(cookie))
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            headers["Location"], self.UI_PREFIX + "/control?flash=reconnected"
+        )
+        self.assertIn("['connect', '192.168.1.50:41234']", self.adb_log())
+        self.assertNotIn("'pair'", self.adb_log())
+
 
 
 if __name__ == "__main__":

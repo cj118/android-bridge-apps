@@ -1,5 +1,22 @@
 # Android Bridge changelog
 
+## 0.3.16
+
+- Fix the Device panel's reconnect form markup. The saved-form fragment was
+  placed one argument early in the control page template, so the pair form's
+  CSRF field swallowed the whole reconnect form. The browser showed a stray
+  `'>` and the raw CSRF token, and `Connect saved tablet` submitted without a
+  CSRF token and was refused with 403 `forbidden`.
+- Escape every dynamic attribute value in the reconnect and pair forms,
+  including the CSRF token and the saved host:port, with
+  `html.escape(..., quote=True)`.
+- Regression tests render the real control page, parse it with `html.parser`,
+  and assert that the CSRF token never appears as visible text, that every
+  POST form carries exactly one hidden CSRF field, that the markup is not
+  broken, and that the parsed reconnect form submits successfully (303).
+- Security behaviour is unchanged: the session, CSRF, origin and
+  Viewing/Control gates still apply to `/control/reconnect`.
+
 ## 0.3.15
 
 - New `Connect saved tablet` button on the control panel. It reconnects to the

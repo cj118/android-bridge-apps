@@ -28,7 +28,7 @@ import control as control_actions
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.15"
+VERSION = "0.3.16"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -1709,6 +1709,7 @@ class Handler(BaseHTTPRequestHandler):
     def _control_page(self, nonce, flash=""):
         session = self.server.ui_sessions.get(nonce) or {}
         csrf = session.get("csrf", "")
+        csrf_attr = html.escape(csrf, quote=True)
         message = _FLASH_MESSAGES.get(flash, "")
         flash_html = (
             "<p style='padding:.5rem;background:#223;color:#cfe'>%s</p>"
@@ -1738,9 +1739,9 @@ class Handler(BaseHTTPRequestHandler):
                     record["id"],
                     remaining,
                     image,
-                    csrf,
+                    csrf_attr,
                     record["id"],
-                    csrf,
+                    csrf_attr,
                     record["id"],
                 )
             )
@@ -1754,9 +1755,9 @@ class Handler(BaseHTTPRequestHandler):
                 "<input type='hidden' name='csrf' value='%s'>"
                 "<button>Connect saved tablet (%s:%s)</button></form>"
                 % (
-                    csrf,
-                    html.escape(saved["host"]),
-                    html.escape(saved["connect_port"]),
+                    csrf_attr,
+                    html.escape(saved["host"], quote=True),
+                    html.escape(saved["connect_port"], quote=True),
                 )
             )
         else:
@@ -1791,15 +1792,15 @@ class Handler(BaseHTTPRequestHandler):
                 flash_html,
                 viewing,
                 control,
-                csrf,
+                csrf_attr,
                 "off" if viewing_open else "on",
                 "ON" if viewing_open else "start",
                 "off" if self.server.control_active else "on",
                 "ON" if self.server.control_active else "start",
-                csrf,
+                csrf_attr,
+                csrf_attr,
                 saved_form,
-                csrf,
-                csrf,
+                csrf_attr,
                 "".join(cards) or "<p>None.</p>",
             )
         )
