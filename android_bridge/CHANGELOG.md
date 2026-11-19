@@ -1,5 +1,19 @@
 # Android Bridge changelog
 
+## 0.3.11
+
+- The bearer token is no longer sufficient for any device action:
+  `/screenshot` also requires an active Viewing session, and `/pair`,
+  `/connect`, `/disconnect` and `/window` accept only a signed-in Home
+  Assistant user with a valid CSRF token. A bearer-only request gets `403`.
+- Pairing moved onto the control page (IP, pairing port, 6-digit code, connect
+  port). The code is written to adb on stdin only and is never logged or echoed.
+- Target validation: private LAN IPv4 only (10/8, 172.16/12, 192.168/16),
+  ports 1-65535, code exactly 6 digits.
+- STOP also ends the viewing session, so every screenshot path is refused
+  afterwards.
+- Startup logs `adb available version=...` or `adb missing`.
+
 ## 0.3.10
 
 - Fix: the control page raised `NameError` while rendering a flash message

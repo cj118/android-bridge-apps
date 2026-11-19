@@ -33,7 +33,20 @@ if args and args[0] == "devices":
     print("List of devices attached")
     print(os.environ.get("FAKE_ADB_SERIAL", "192.168.1.50:41234") + "\tdevice product:x model:SM_X210 device:y")
     sys.exit(0)
-if args and args[0] in ("connect", "disconnect"):
+if args and args[0] == "pair":
+    code = sys.stdin.readline().strip()
+    target = os.environ.get("FAKE_ADB_STDIN")
+    if target:
+        with open(target, "a") as fh:
+            fh.write(code + "\n")
+    if code != os.environ.get("FAKE_ADB_CODE", "123456"):
+        sys.exit(1)
+    print("Successfully paired")
+    sys.exit(0)
+if args and args[0] == "connect":
+    print("connected to " + (args[1] if len(args) > 1 else "device"))
+    sys.exit(0)
+if args and args[0] == "disconnect":
     sys.exit(0)
 if "-s" in args and "exec-out" in args:
     with open(os.environ["FAKE_ADB_PNG"], "rb") as fh:
@@ -110,7 +123,7 @@ class ControlSecurityTests(unittest.TestCase):
     def form(self, path, data, headers=None):
         h = {"Content-Type": "application/x-www-form-urlencoded"}
         h.update(headers or {})
-        if path.startswith("/control") and "X-Ingress-Path" not in h:
+        if "X-Ingress-Path" not in h:
             h["X-Ingress-Path"] = self.UI_PREFIX
         return self.req("POST", path, h, urllib.parse.urlencode(data).encode())
 
@@ -512,9 +525,9 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertEqual(payload["result"]["content"][0]["text"], "control_session_inactive")
 
     def test_disconnect_ends_sessions(self):
-        self.start_control()
-        status, _, _ = self.form("/disconnect", {"token": self.token}, {})
-        self.assertEqual(status, 200)
+        cookie, csrf = self.start_control()
+        status, _, _ = self.ctl("/disconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
         self.assertFalse(self.server.control_active)
         self.assertFalse(self.server.viewing_active)
 
@@ -837,10 +850,12 @@ class ControlSecurityTests(unittest.TestCase):
             headers.get("Location"), self.UI_PREFIX + "/control?flash=session"
         )
 
-        api, body, _ = self.form("/window", {"action": "on"},
-                                 {"Authorization": "Bearer " + self.token})
-        self.assertEqual(api, 200)
-        self.assertIn(b"viewing", body)
+        api, body, _ = self.form(
+            "/pair", {"host": "192.168.1.50"},
+            {"Authorization": "Bearer " + self.token},
+        )
+        self.assertEqual(api, 403)
+        self.assertIn(b"forbidden", body)
 
         stop, body, _ = self.form(
             "/control/stop", {}, {"Authorization": "Bearer " + self.token}
@@ -1009,6 +1024,81 @@ class ControlSecurityTests(unittest.TestCase):
         status, page, _ = self.req("GET", "/control?flash=zzz", cookie)
         self.assertEqual(status, 200)
         self.assertNotIn(b"zzz", page)
+
+
+    # ---------- pairing requires the HA-user session ----------
+
+    def test_bearer_cannot_pair_connect_or_disconnect(self):
+        cases = (
+            ("/pair", {"host": "192.168.1.50", "pairing_port": "37123",
+                       "code": "123456", "connect_port": "41234"}),
+            ("/connect", {"host": "192.168.1.50", "connect_port": "41234"}),
+            ("/disconnect", {}),
+        )
+        for path, data in cases:
+            with self.subTest(path=path):
+                status, body, _ = self.req(
+                    "POST", path,
+                    {"Content-Type": "application/x-www-form-urlencoded",
+                     "Authorization": "Bearer " + self.token},
+                    urllib.parse.urlencode(data).encode(),
+                )
+                self.assertEqual(status, 403)
+
+    def test_pair_from_the_control_page_redirects_and_uses_stdin(self):
+        cookie, csrf = self.start_control()
+        stdin_log = os.path.join(self.tmp, "adb-stdin.log")
+        if os.path.exists(stdin_log):
+            os.unlink(stdin_log)
+        os.environ["FAKE_ADB_STDIN"] = stdin_log
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, headers = self.ctl(
+                "/pair",
+                {"host": "192.168.1.50", "pairing_port": "37123",
+                 "code": "123456", "connect_port": "41234"},
+                cookie, csrf,
+            )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], self.UI_PREFIX + "/control?flash=paired")
+        with open(stdin_log, encoding="utf-8") as handle:
+            self.assertIn("123456", handle.read())
+        self.assertNotIn("123456", self.adb_log())
+        self.assertNotIn("123456", capture.getvalue())
+
+        status, page, _ = self.follow(headers["Location"], cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Tablet paired and connected", page)
+
+    def test_pair_rejects_bad_host_port_and_code(self):
+        cookie, csrf = self.start_control()
+        base = {"host": "192.168.1.50", "pairing_port": "37123",
+                "code": "123456", "connect_port": "41234"}
+        cases = (
+            dict(base, host="8.8.8.8"),
+            dict(base, host="example.com"),
+            dict(base, host="127.0.0.1"),
+            dict(base, pairing_port="0"),
+            dict(base, connect_port="70000"),
+            dict(base, code="12345"),
+            dict(base, code="1234567"),
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                status, _, _ = self.ctl("/pair", case, cookie, csrf)
+                self.assertEqual(status, 400)
+
+    def test_stop_blocks_every_screenshot_path(self):
+        cookie, csrf = self.start_control()
+        self.assertTrue(self.server.viewing_active)
+        status, _, _ = self.ctl("/control/stop", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertFalse(self.server.viewing_active)
+        status, body, _ = self.req(
+            "GET", "/screenshot", {"Authorization": "Bearer " + self.token}
+        )
+        self.assertEqual(status, 403)
+        self.assertIn(b"viewing_session_closed", body)
 
 
 if __name__ == "__main__":

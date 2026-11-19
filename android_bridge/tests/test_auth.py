@@ -216,6 +216,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 401)
 
     def test_screenshot_with_token_without_device_is_409(self):
+        self.server.viewing_active = True
         status, body, _ = self.request("GET", "/screenshot", self.auth())
         self.assertEqual(status, 409)
         self.assertIn(b"device_not_paired", body)

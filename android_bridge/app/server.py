@@ -27,7 +27,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.10"
+VERSION = "0.3.11"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -67,6 +67,9 @@ _FLASH_MESSAGES = {
     "stopped": "STOP: control disabled and pending approvals cancelled.",
     "ok": "Done.",
     "error": "The action was not completed. Check the log.",
+    "paired": "Tablet paired and connected.",
+    "pair_failed": "Pairing failed. Check the IP, ports and code.",
+    "disconnected": "Tablet disconnected.",
 }
 _INGRESS_PATH_RE = re.compile(r"\A/api/hassio_ingress/[A-Za-z0-9_-]{1,64}\Z")
 _TRACKED_HEADERS = (
@@ -111,24 +114,6 @@ def mcp_source_allowed(address):
 _TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{32,128}\Z")
 _LOGGABLE_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 _DUMMY_TOKEN = b"x" * 43
-
-_PAIR_PAGE = (
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<title>Android Bridge - pair</title></head>"
-    "<body style='font-family:system-ui;max-width:34rem;margin:3rem auto'>"
-    "<h1>Pair tablet</h1>"
-    "<p>On the tablet: Settings &rarr; Developer options &rarr; Wireless debugging."
-    " The tablet shows a pairing port and a separate connect port.</p>"
-    "<form method='post' action='pair'>"
-    "<p><label>Bearer token<br><input name='token' type='password' size='54'></label></p>"
-    "<p><label>Tablet IP<br><input name='host' size='30'></label></p>"
-    "<p><label>Pairing port<br><input name='pairing_port' size='8'></label></p>"
-    "<p><label>6-digit pairing code<br><input name='code' size='8'></label></p>"
-    "<p><label>Connect port<br><input name='connect_port' size='8'></label></p>"
-    "<p><button type='submit'>Pair and connect</button></p>"
-    "</form></body></html>"
-).encode("utf-8")
-
 
 _CONTROL_LOGIN_HEAD = (
     "<!doctype html><html><head><meta charset='utf-8'>"
@@ -538,10 +523,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
 
-        if path == "/pair":
-            self._send_html(_PAIR_PAGE)
-            return
-
         if path == "/control":
             nonce = self._ui_session()
             if not nonce:
@@ -582,6 +563,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/screenshot":
             if not self._require_auth():
+                return
+            if not self.server.viewing_active:
+                self._send_json(403, {"error": "viewing_session_closed"})
                 return
             self._handle_screenshot()
             return
@@ -990,7 +974,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/control":
             self._do_login(fields)
             return
-        if path.startswith("/control/"):
+        if path in ("/pair", "/connect", "/disconnect", "/window") or path.startswith("/control/"):
             nonce = self._ui_session()
             csrf = fields.get("csrf")
 
@@ -1026,22 +1010,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._do_session(fields)
             elif path == "/control/approve":
                 self._do_approve(fields)
-            else:
+            elif path == "/control/reject":
                 self._do_reject(fields)
+            elif path == "/pair":
+                self._do_pair(fields)
+            elif path == "/connect":
+                self._do_connect(fields)
+            elif path == "/disconnect":
+                self._do_disconnect()
+            else:
+                self._do_window(fields)
             return
 
-        if not self._require_auth(fields.get("token")):
-            return
-        fields.pop("token", None)
-
-        if path == "/window":
-            self._do_window(fields)
-        elif path == "/pair":
-            self._do_pair(fields)
-        elif path == "/connect":
-            self._do_connect(fields)
-        else:
-            self._do_disconnect()
+        self.close_connection = True
+        self._send_json(405, {"error": "method_not_allowed"}, {"Allow": "GET, POST"})
 
     def _do_window(self, fields):
         """Start or stop the viewing session. No fixed duration."""
@@ -1457,6 +1439,7 @@ class Handler(BaseHTTPRequestHandler):
     def _do_stop(self):
         with self.server.control_lock:
             self.server.control_active = False
+            self.server.viewing_active = False
             self.server.approvals.clear()
         self._respond({"control": False, "pending": 0}, flash="stopped")
 
@@ -1583,7 +1566,19 @@ class Handler(BaseHTTPRequestHandler):
             "<form method='post' action='control/stop' style='margin-top:1rem'>"
             "<input type='hidden' name='csrf' value='%s'>"
             "<button style='background:#a00;color:#fff;padding:.6rem 2rem'>STOP</button>"
-            "</form><h2>Pending approvals</h2>%s</body></html>"
+            "</form>"
+            "<h2>Device</h2>"
+            "<form method='post' action='pair'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<p>IP <input name='host' size='16'> "
+            "Pairing port <input name='pairing_port' size='6'> "
+            "Code <input name='code' size='6' autocomplete='off'> "
+            "Connect port <input name='connect_port' size='6'></p>"
+            "<button>Pair and connect</button></form>"
+            "<form method='post' action='disconnect' style='margin-top:.5rem'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<button>Disconnect</button></form>"
+            "<h2>Pending approvals</h2>%s</body></html>"
             % (
                 flash_html,
                 viewing,
@@ -1593,6 +1588,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ON" if self.server.viewing_active else "start",
                 "off" if self.server.control_active else "on",
                 "ON" if self.server.control_active else "start",
+                csrf,
+                csrf,
                 csrf,
                 "".join(cards) or "<p>None.</p>",
             )
@@ -1605,25 +1602,31 @@ class Handler(BaseHTTPRequestHandler):
         code = (fields.get("code") or "").strip()
         connect_port = (fields.get("connect_port") or "").strip()
         try:
+            adbctl.validate_target(host, pairing_port, connect_port, code)
+        except adbctl.AdbError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        try:
             adbctl.pair(host, pairing_port, code)
             adbctl.connect(host, connect_port)
         except adbctl.AdbError:
-            self._send_json(400, {"error": "pairing_failed"})
+            self._respond({"error": "pairing_failed"}, 400, flash="pair_failed")
             return
         try:
             save_device(self.server.data_dir, host, connect_port)
         except OSError:
             self._send_json(500, {"error": "state_write_failed"})
             return
-        self._send_json(200, {"status": "paired"})
+        self._respond({"status": "paired"}, flash="paired")
 
     def _do_connect(self, fields):
         host = (fields.get("host") or "").strip()
         port = (fields.get("connect_port") or "").strip()
         try:
+            adbctl.validate_target(host, port)
             adbctl.connect(host, port)
         except adbctl.AdbError:
-            self._send_json(400, {"error": "connect_failed"})
+            self._respond({"error": "connect_failed"}, 400, flash="pair_failed")
             return
         try:
             save_device(self.server.data_dir, host, port)
@@ -1638,9 +1641,9 @@ class Handler(BaseHTTPRequestHandler):
             for device in adbctl.list_devices():
                 adbctl.disconnect(device["serial"])
         except adbctl.AdbError:
-            self._send_json(502, {"error": "disconnect_failed"})
+            self._respond({"error": "disconnect_failed"}, 502, flash="error")
             return
-        self._send_json(200, {"status": "disconnected"})
+        self._respond({"status": "disconnected"}, flash="disconnected")
 
     def _reject_method(self):
         self.close_connection = True
@@ -1704,6 +1707,14 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     return server
 
 
+def _log_adb_version():
+    version = adbctl.version()
+    if version:
+        sys.stderr.write("adb available version=%s\n" % version)
+    else:
+        sys.stderr.write("adb missing\n")
+
+
 def main() -> int:
     try:
         server = create_server()
@@ -1716,6 +1727,7 @@ def main() -> int:
         )
         return 1
 
+    _log_adb_version()
     sys.stderr.write(
         "android-bridge %s listening on %d (bearer auth enabled)\n"
         % (VERSION, PORT)

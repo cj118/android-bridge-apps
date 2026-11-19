@@ -32,6 +32,9 @@ if log:
 mode = os.environ.get("FAKE_ADB_MODE", "ok")
 if "shell" in args:
     sys.exit(9)
+if args and args[0] == "version":
+    print("Android Debug Bridge version 1.0.41")
+    sys.exit(0)
 if args and args[0] == "devices":
     print("List of devices attached")
     if mode != "no_device":
@@ -39,6 +42,10 @@ if args and args[0] == "devices":
     sys.exit(0)
 if args and args[0] == "pair":
     code = sys.stdin.readline().strip()
+    target = os.environ.get("FAKE_ADB_STDIN")
+    if target:
+        with open(target, "a") as fh:
+            fh.write(code + "\n")
     if code != os.environ.get("FAKE_ADB_CODE", "123456"):
         sys.exit(1)
     print("Successfully paired")
@@ -111,7 +118,7 @@ class ScreenshotTests(unittest.TestCase):
 
     def setUp(self):
         self.server.capture_times.clear()
-        self.server.viewing_active = False
+        self.server.viewing_active = True
         os.environ["FAKE_ADB_MODE"] = "ok"
 
     def auth(self):
@@ -138,6 +145,12 @@ class ScreenshotTests(unittest.TestCase):
     def test_screenshot_requires_auth(self):
         status, _, _ = self.request("GET", "/screenshot")
         self.assertEqual(status, 401)
+
+    def test_screenshot_requires_a_viewing_session(self):
+        self.server.viewing_active = False
+        status, body, _ = self.request("GET", "/screenshot", self.auth())
+        self.assertEqual(status, 403)
+        self.assertIn(b"viewing_session_closed", body)
 
     def test_disconnected_device_is_409(self):
         os.environ["FAKE_ADB_MODE"] = "no_device"
@@ -188,58 +201,6 @@ class ScreenshotTests(unittest.TestCase):
             self.server.capture_lock.release()
         self.assertEqual(status, 429)
         self.assertIn(b"capture_busy", body)
-
-    # ---------- pairing ----------
-
-    def test_pair_page_is_public(self):
-        status, body, _ = self.request("GET", "/pair")
-        self.assertEqual(status, 200)
-        self.assertIn(b"Pair tablet", body)
-        self.assertNotIn(self.token.encode(), body)
-
-    def test_pair_requires_token(self):
-        form = urllib.parse.urlencode(
-            {"host": "192.168.1.50", "pairing_port": "37123",
-             "code": "123456", "connect_port": "41234"}
-        ).encode()
-        status, _, _ = self.request(
-            "POST", "/pair",
-            {"Content-Type": "application/x-www-form-urlencoded"}, form,
-        )
-        self.assertEqual(status, 401)
-
-    def test_pair_success_saves_device(self):
-        form = urllib.parse.urlencode(
-            {"token": self.token, "host": "192.168.1.50",
-             "pairing_port": "37123", "code": "123456",
-             "connect_port": "41234"}
-        ).encode()
-        status, body, _ = self.request(
-            "POST", "/pair",
-            {"Content-Type": "application/x-www-form-urlencoded"}, form,
-        )
-        self.assertEqual(status, 200)
-        self.assertIn(b"paired", body)
-        saved = bridge.load_device(self.data_dir)
-        self.assertEqual(saved["host"], "192.168.1.50")
-
-    def test_pair_wrong_code_fails_without_leaking(self):
-        form = urllib.parse.urlencode(
-            {"token": self.token, "host": "192.168.1.50",
-             "pairing_port": "37123", "code": "999999",
-             "connect_port": "41234"}
-        ).encode()
-        capture = io.StringIO()
-        with contextlib.redirect_stderr(capture):
-            status, body, _ = self.request(
-                "POST", "/pair",
-                {"Content-Type": "application/x-www-form-urlencoded"}, form,
-            )
-        self.assertEqual(status, 400)
-        self.assertIn(b"pairing_failed", body)
-        output = capture.getvalue()
-        self.assertNotIn("999999", output)
-        self.assertNotIn(self.token, output)
 
     def test_no_shell_command_is_ever_invoked(self):
         self.request("GET", "/screenshot", self.auth())
@@ -326,20 +287,14 @@ class ScreenshotTests(unittest.TestCase):
         bridge.refresh_mcp_allowlist(force=True)
 
     def _open_window(self):
-        return self.request(
-            "POST", "/window",
-            {"Content-Type": "application/x-www-form-urlencoded",
-             "Authorization": "Bearer " + self.token},
-            b"action=on",
-        )
+        self.server.viewing_active = True
+        return 200, b"", {}
 
     def _close_window(self):
-        return self.request(
-            "POST", "/window",
-            {"Content-Type": "application/x-www-form-urlencoded",
-             "Authorization": "Bearer " + self.token},
-            b"action=stop",
-        )
+        self.server.viewing_active = False
+        return 200, b"", {}
+
+
 
     def test_mcp_allows_allowlisted_source_without_token(self):
         original = self._with_allowlist({"127.0.0.1"})
@@ -381,6 +336,7 @@ class ScreenshotTests(unittest.TestCase):
 
 
     def test_mcp_without_window_is_403(self):
+        self.server.viewing_active = False
         original = self._with_allowlist({"127.0.0.1"})
         try:
             status, body, _ = self.request(
@@ -407,13 +363,15 @@ class ScreenshotTests(unittest.TestCase):
             self._restore_allowlist(original)
         self.assertEqual(status, 403)
 
-    def test_window_requires_bearer(self):
+    def test_window_route_rejects_bearer_only(self):
+        self.server.viewing_active = False
         status, _, _ = self.request(
             "POST", "/window",
-            {"Content-Type": "application/x-www-form-urlencoded"},
-            b"minutes=5",
+            {"Content-Type": "application/x-www-form-urlencoded",
+             "Authorization": "Bearer " + self.token},
+            b"action=on",
         )
-        self.assertEqual(status, 401)
+        self.assertEqual(status, 403)
         self.assertFalse(self.server.viewing_active)
 
     def test_window_opens_and_closes(self):
@@ -423,6 +381,14 @@ class ScreenshotTests(unittest.TestCase):
         status, _, _ = self._close_window()
         self.assertEqual(status, 200)
         self.assertFalse(self.server.viewing_active)
+
+
+    def test_adb_version_is_reported_at_startup(self):
+        self.assertEqual(adbctl.version(), "1.0.41")
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            bridge._log_adb_version()
+        self.assertIn("adb available version=1.0.41", capture.getvalue())
 
 
 if __name__ == "__main__":

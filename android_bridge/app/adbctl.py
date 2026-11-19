@@ -27,10 +27,25 @@ class AdbError(RuntimeError):
 
 
 def _host(value: str) -> str:
+    """Only private LAN IPv4 literals are accepted."""
     value = (value or "").strip()
-    if not _HOST_RE.match(value):
-        raise AdbError("invalid host")
-    return value
+    parts = value.split(".")
+    if len(parts) != 4:
+        raise AdbError("host must be a private LAN IPv4 address")
+    try:
+        octets = [int(part) for part in parts]
+    except ValueError:
+        raise AdbError("host must be a private LAN IPv4 address") from None
+    if any(octet < 0 or octet > 255 for octet in octets):
+        raise AdbError("host must be a private LAN IPv4 address")
+    first, second = octets[0], octets[1]
+    if (
+        first == 10
+        or (first == 172 and 16 <= second <= 31)
+        or (first == 192 and second == 168)
+    ):
+        return value
+    raise AdbError("host must be a private LAN IPv4 address")
 
 
 def _port(value: str) -> str:
@@ -95,6 +110,32 @@ def connect(host: str, port: str, timeout: float = DEFAULT_TIMEOUT) -> None:
     returncode, out = _run(["connect", target], timeout=timeout, max_bytes=65536)
     if returncode != 0 or b"connected" not in out.lower():
         raise AdbError("connect failed")
+
+
+def validate_target(host: str, port: str, connect_port=None, code=None) -> None:
+    """Validate a pairing/connect target before touching adb."""
+    _host(host)
+    _port(port)
+    if connect_port is not None:
+        _port(connect_port)
+    if code is not None and not _CODE_RE.match((code or "").strip()):
+        raise AdbError("pairing code must be 6 digits")
+
+
+def version(timeout: float = 5.0):
+    """Return the adb version string, or None when adb is missing."""
+    try:
+        returncode, out = _run(["version"], timeout=timeout, max_bytes=4096)
+    except AdbError:
+        return None
+    if returncode != 0:
+        return None
+    for line in out.decode("utf-8", "replace").splitlines():
+        lowered = line.lower()
+        if "version" in lowered:
+            tail = line[lowered.index("version") + len("version"):].strip()
+            return tail.split()[0] if tail else None
+    return None
 
 
 def disconnect(serial: str, timeout: float = 10.0) -> None:
