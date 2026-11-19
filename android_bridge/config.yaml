@@ -1,5 +1,5 @@
 name: "Android Bridge (b5)"
-version: "0.3.7"
+version: "0.3.8"
 slug: android_bridge
 description: "Android screen bridge: read-only viewing, approval-gated input"
 arch:
@@ -11,7 +11,13 @@ ingress: true
 ingress_port: 8791
 panel_title: "Android Bridge (b5)"
 panel_icon: mdi:cellphone-link
+panel_admin: true
 hassio_api: false
 homeassistant_api: false
 auth_api: false
 map: []
+options:
+  allowed_ha_users: []
+schema:
+  allowed_ha_users:
+    - str

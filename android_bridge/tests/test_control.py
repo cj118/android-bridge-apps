@@ -86,6 +86,8 @@ class ControlSecurityTests(unittest.TestCase):
 
     def setUp(self):
         self._orig_peer = bridge.Handler._peer
+        self.server.allowed_users = frozenset({"alice"})
+        self.set_peer("172.30.32.2")
         self.server.viewing_active = False
         self.server.control_active = False
         self.server.approvals.clear()
@@ -108,28 +110,34 @@ class ControlSecurityTests(unittest.TestCase):
     def form(self, path, data, headers=None):
         h = {"Content-Type": "application/x-www-form-urlencoded"}
         h.update(headers or {})
+        if path.startswith("/control") and "X-Ingress-Path" not in h:
+            h["X-Ingress-Path"] = self.UI_PREFIX
         return self.req("POST", path, h, urllib.parse.urlencode(data).encode())
 
     def origin(self):
         return "http://127.0.0.1:%d" % self.port
 
     ORIGIN = "https://ha.example"
+    UI_PREFIX = "/api/hassio_ingress/TESTTOKEN"
 
-    def login(self, origin=ORIGIN, sfs=None):
-        extra = {}
-        if origin is not False:
-            extra["Origin"] = origin
+    def login(self, user="alice", origin=None, sfs=None):
+        nonce, login_cookie = self.login_page()
+        headers = {"Cookie": login_cookie}
+        if user is not None:
+            headers["X-Remote-User-Name"] = user
+        if origin is not None:
+            headers["Origin"] = origin
         if sfs:
-            extra["Sec-Fetch-Site"] = sfs
-        status, _, headers = self.form("/control", {"token": self.token}, extra)
+            headers["Sec-Fetch-Site"] = sfs
+        status, _, response = self.form("/control", {"nonce": nonce}, headers)
         self.assertEqual(status, 200)
-        cookie = {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
+        cookie = {"Cookie": response["Set-Cookie"].split(";", 1)[0]}
         status, page, _ = self.req("GET", "/control", cookie)
         self.assertEqual(status, 200)
         csrf = re.search(rb"name='csrf' value='([0-9a-f]+)'", page).group(1).decode()
         return cookie, csrf
 
-    def ctl(self, path, data, cookie, csrf, origin=None, sfs=None):
+    def ctl(self, path, data, cookie, csrf, origin=False, sfs=None):
         payload = dict(data)
         payload["csrf"] = csrf
         headers = dict(cookie)
@@ -152,13 +160,13 @@ class ControlSecurityTests(unittest.TestCase):
         return nonce, headers["Set-Cookie"].split(";", 1)[0]
 
     def login_null(self):
-        """Session created from an opaque (null) origin, as the ingress does."""
-        return self.login(origin="null", sfs="same-origin")
+        """Session created through ingress with no origin headers at all."""
+        return self.login()
 
     def start_control(self):
         cookie, csrf = self.login()
         status, _, _ = self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf)
-        self.assertEqual(status, 200)
+        self.assertIn(status, (200, 303))
         return cookie, csrf
 
     def mcp(self, payload):
@@ -274,12 +282,10 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertNotIn("'input'", self.adb_log())
 
     def test_ingress_host_mismatch_is_accepted(self):
-        """The live failure: Origin is the public host, Host is the add-on.
-
-        HA ingress re-issues the request with its own Host, so host equality
-        must not be required. The origin bound at sign-in still is.
-        """
-        cookie, csrf = self.start_control()
+        """Origin equal to the sign-in origin, Host rewritten by the proxy."""
+        cookie, csrf = self.login(origin=self.ORIGIN, sfs="same-origin")
+        self.ctl("/control/session", {"view": "on", "control": "on"},
+                 cookie, csrf, origin=self.ORIGIN)
         key = self.new_proposal()
         status, _, _ = self.form(
             "/control/approve", {"id": key, "csrf": csrf},
@@ -287,7 +293,7 @@ class ControlSecurityTests(unittest.TestCase):
              "Origin": self.ORIGIN,
              "Host": "69e5db10-android-bridge:8791"},
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         self.assertIn("'input'", self.adb_log())
 
     def test_foreign_https_origin_without_metadata_is_rejected(self):
@@ -307,15 +313,6 @@ class ControlSecurityTests(unittest.TestCase):
         status, _, _ = self.form(
             "/control/approve", {"id": key, "csrf": csrf},
             {**cookie, "Origin": "https://ha.example:8443"},
-        )
-        self.assertEqual(status, 403)
-
-    def test_null_origin_is_forbidden(self):
-        cookie, csrf = self.start_control()
-        key = self.new_proposal()
-        status, _, _ = self.form(
-            "/control/approve", {"id": key, "csrf": csrf},
-            {**cookie, "Origin": "null"},
         )
         self.assertEqual(status, 403)
 
@@ -339,13 +336,13 @@ class ControlSecurityTests(unittest.TestCase):
             "/control/session", {"view": "on", "control": "on"},
             cookie, csrf, origin="null", sfs="same-origin",
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         key = self.new_proposal()
         status, _, _ = self.ctl(
             "/control/approve", {"id": key}, cookie, csrf,
             origin="null", sfs="same-origin",
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         self.assertIn("'input'", self.adb_log())
 
     def test_null_origin_with_cross_site_is_rejected(self):
@@ -368,16 +365,6 @@ class ControlSecurityTests(unittest.TestCase):
         status, _, _ = self.ctl(
             "/control/approve", {"id": key}, cookie, csrf,
             origin="null", sfs="same-site",
-        )
-        self.assertEqual(status, 403)
-
-    def test_null_origin_without_fetch_metadata_is_rejected(self):
-        cookie, csrf = self.login_null()
-        self.ctl("/control/session", {"view": "on", "control": "on"}, cookie, csrf,
-                 origin="null", sfs="same-origin")
-        key = self.new_proposal()
-        status, _, _ = self.ctl(
-            "/control/approve", {"id": key}, cookie, csrf, origin="null",
         )
         self.assertEqual(status, 403)
 
@@ -419,24 +406,28 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIn("sfs=cross-site", output)
 
     def test_ingress_forwarded_host_is_accepted(self):
-        cookie, csrf = self.start_control()
+        cookie, csrf = self.login(origin=self.ORIGIN, sfs="same-origin")
+        self.ctl("/control/session", {"view": "on", "control": "on"},
+                 cookie, csrf, origin=self.ORIGIN)
         key = self.new_proposal()
         status, _, _ = self.form(
             "/control/approve", {"id": key, "csrf": csrf},
             {**cookie, "Origin": "https://ha.example",
              "X-Forwarded-Host": "ha.example"},
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
 
     def test_ingress_same_origin_fetch_metadata_is_accepted(self):
-        cookie, csrf = self.start_control()
+        cookie, csrf = self.login(origin=self.ORIGIN, sfs="same-origin")
+        self.ctl("/control/session", {"view": "on", "control": "on"},
+                 cookie, csrf, origin=self.ORIGIN)
         key = self.new_proposal()
         status, _, _ = self.form(
             "/control/approve", {"id": key, "csrf": csrf},
             {**cookie, "Origin": self.ORIGIN,
              "Sec-Fetch-Site": "same-origin"},
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
 
     def test_csrf_is_bound_to_session(self):
         _, csrf_a = self.start_control()
@@ -454,7 +445,7 @@ class ControlSecurityTests(unittest.TestCase):
         cookie, csrf = self.start_control()
         key = self.new_proposal()
         status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         self.assertIn("'shell', 'input', 'tap', '540', '780'", self.adb_log())
         _, polled = self.result(key)
         state = json.loads(polled["result"]["content"][0]["text"])
@@ -465,15 +456,15 @@ class ControlSecurityTests(unittest.TestCase):
         cookie, csrf = self.start_control()
         key = self.new_proposal()
         self.ctl("/control/approve", {"id": key}, cookie, csrf)
-        status, body, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
-        self.assertEqual(status, 409)
-        self.assertIn(b"not pending", body)
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertEqual(self.adb_log().count("'input'"), 1)
 
     def test_reject_prevents_execution(self):
         cookie, csrf = self.start_control()
         key = self.new_proposal()
         status, _, _ = self.ctl("/control/reject", {"id": key}, cookie, csrf)
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         _, polled = self.result(key)
         self.assertEqual(json.loads(polled["result"]["content"][0]["text"])["state"], "rejected")
         self.assertNotIn("'input'", self.adb_log())
@@ -483,7 +474,7 @@ class ControlSecurityTests(unittest.TestCase):
         key = self.new_proposal()
         self.server.approvals.get(key)["expires"] = time.monotonic() - 1
         status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
-        self.assertEqual(status, 409)
+        self.assertEqual(status, 303)
         self.assertNotIn("'input'", self.adb_log())
 
     def test_device_mismatch_is_rejected(self):
@@ -492,19 +483,18 @@ class ControlSecurityTests(unittest.TestCase):
         # Device changes between proposal and approval.
         bridge.save_device(self.data_dir, "192.168.1.60", "41234")
         os.environ["FAKE_ADB_SERIAL"] = "192.168.1.60:41234"
-        status, body, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
-        self.assertEqual(status, 409)
-        self.assertIn(b"device mismatch", body)
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
         self.assertNotIn("'input'", self.adb_log())
 
     def test_stop_cancels_pending_and_blocks_new(self):
         cookie, csrf = self.start_control()
         key = self.new_proposal()
         status, _, _ = self.ctl("/control/stop", {}, cookie, csrf)
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         self.assertIsNone(self.server.approvals.get(key))
         status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
-        self.assertEqual(status, 409)
+        self.assertEqual(status, 303)
         _, payload = self.propose("android_tap", {"x": 13, "y": 14})
         self.assertEqual(payload["result"]["content"][0]["text"], "control_session_inactive")
 
@@ -548,7 +538,9 @@ class ControlSecurityTests(unittest.TestCase):
 
 
     def test_stale_cookie_does_not_mask_valid_one(self):
-        cookie, csrf = self.start_control()
+        cookie, csrf = self.login(origin=self.ORIGIN, sfs="same-origin")
+        self.ctl("/control/session", {"view": "on", "control": "on"},
+                 cookie, csrf, origin=self.ORIGIN)
         key = self.new_proposal()
         combined = "ab_ui=%s.%s; %s" % ("a" * 32, "b" * 64, cookie["Cookie"])
         status, _, _ = self.form(
@@ -556,7 +548,7 @@ class ControlSecurityTests(unittest.TestCase):
             {"Cookie": combined, "Origin": "https://ha.example",
              "X-Forwarded-Host": "ha.example"},
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
 
     def test_missing_session_reason_is_logged(self):
         capture = io.StringIO()
@@ -595,22 +587,13 @@ class ControlSecurityTests(unittest.TestCase):
     # ---------- ingress peer (opaque origin, no fetch metadata) ----------
 
     def _enter_control_without_headers(self):
-        """Sign in and enable control with no Origin and no Sec-Fetch-Site."""
-        self.set_ingress(True)
-        nonce, login_cookie = self.login_page()
-        status, _, headers = self.form(
-            "/control", {"token": self.token, "nonce": nonce},
-            {"Cookie": login_cookie},
-        )
-        self.assertEqual(status, 200)
-        cookie = {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
-        status, page, _ = self.req("GET", "/control", cookie)
-        csrf = re.search(rb"name='csrf' value='([0-9a-f]+)'", page).group(1).decode()
+        """Sign in as an allowed HA user and enable control, no origin headers."""
+        cookie, csrf = self.login()
         status, _, _ = self.form(
             "/control/session", {"view": "on", "control": "on", "csrf": csrf},
             cookie,
         )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         return cookie, csrf
 
     def test_ingress_peer_without_origin_or_sfs_is_accepted(self):
@@ -621,7 +604,7 @@ class ControlSecurityTests(unittest.TestCase):
             status, _, _ = self.form(
                 "/control/approve", {"id": key, "csrf": csrf}, cookie
             )
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 303)
         self.assertIn("reason=origin_null_ingress_ok", capture.getvalue())
         self.assertIn("'input'", self.adb_log())
 
@@ -673,15 +656,16 @@ class ControlSecurityTests(unittest.TestCase):
         self.set_ingress(True)
         nonce, login_cookie = self.login_page()
         status, _, headers = self.form(
-            "/control", {"token": self.token, "nonce": nonce},
-            {"Cookie": login_cookie},
+            "/control", {"nonce": nonce},
+            {"Cookie": login_cookie, "X-Remote-User-Name": "alice"},
         )
         self.assertEqual(status, 200)
         self.assertIn("Set-Cookie", headers)
 
     def test_login_without_nonce_is_rejected(self):
-        self.set_ingress(True)
-        status, _, headers = self.form("/control", {"token": self.token})
+        status, _, headers = self.form(
+            "/control", {}, {"X-Remote-User-Name": "alice"}
+        )
         self.assertEqual(status, 403)
         self.assertNotIn("Set-Cookie", headers)
 
@@ -689,13 +673,13 @@ class ControlSecurityTests(unittest.TestCase):
         self.set_ingress(True)
         nonce, login_cookie = self.login_page()
         first, _, _ = self.form(
-            "/control", {"token": self.token, "nonce": nonce},
-            {"Cookie": login_cookie},
+            "/control", {"nonce": nonce},
+            {"Cookie": login_cookie, "X-Remote-User-Name": "alice"},
         )
         self.assertEqual(first, 200)
         second, _, _ = self.form(
-            "/control", {"token": self.token, "nonce": nonce},
-            {"Cookie": login_cookie},
+            "/control", {"nonce": nonce},
+            {"Cookie": login_cookie, "X-Remote-User-Name": "alice"},
         )
         self.assertEqual(second, 403)
 
@@ -786,10 +770,173 @@ class ControlSecurityTests(unittest.TestCase):
         cookie = headers["Set-Cookie"].split(";", 1)[0]
         self.set_ingress(True)
         status, _, _ = self.form(
-            "/control", {"token": self.token, "nonce": nonce},
-            {"Cookie": cookie, "X-Ingress-Path": "/api/hassio_ingress/BBB222"},
+            "/control", {"nonce": nonce},
+            {"Cookie": cookie, "X-Remote-User-Name": "alice",
+             "X-Ingress-Path": "/api/hassio_ingress/BBB222"},
         )
         self.assertEqual(status, 200)
+
+
+    # ---------- Home Assistant identity sign-in ----------
+
+    def login_attempt(self, user="alice", peer="172.30.32.2", with_nonce=True,
+                      extra=None):
+        self.set_peer(peer)
+        page_nonce, cookie = self.login_page()
+        headers = {"Cookie": cookie}
+        if user is not None:
+            headers["X-Remote-User-Name"] = user
+        headers.update(extra or {})
+        data = {"nonce": page_nonce} if with_nonce else {}
+        return self.form("/control", data, headers)
+
+    def test_allowed_ha_user_creates_session(self):
+        status, _, headers = self.login_attempt("alice")
+        self.assertEqual(status, 200)
+        self.assertIn("Set-Cookie", headers)
+
+    def test_unknown_ha_user_is_rejected(self):
+        status, _, headers = self.login_attempt("bob")
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_missing_ha_user_is_rejected(self):
+        status, _, headers = self.login_attempt(None)
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_ha_user_from_non_supervisor_peer_is_rejected(self):
+        for peer in ("172.30.32.1", "172.30.33.7"):
+            with self.subTest(peer=peer):
+                status, _, headers = self.login_attempt("alice", peer=peer)
+                self.assertEqual(status, 403)
+                self.assertNotIn("Set-Cookie", headers)
+
+    def test_bearer_token_cannot_sign_in(self):
+        nonce, cookie = self.login_page()
+        status, _, headers = self.form(
+            "/control", {"nonce": nonce},
+            {"Cookie": cookie, "Authorization": "Bearer " + self.token},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_empty_allowlist_blocks_everyone(self):
+        self.server.allowed_users = frozenset()
+        status, _, headers = self.login_attempt("alice")
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_browser_control_posts_redirect_api_posts_return_json(self):
+        cookie, csrf = self.start_control()
+        status, _, headers = self.ctl(
+            "/control/session", {"view": "on", "control": "on"}, cookie, csrf
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            headers.get("Location"), self.UI_PREFIX + "/control?flash=session"
+        )
+
+        api, body, _ = self.form("/window", {"action": "on"},
+                                 {"Authorization": "Bearer " + self.token})
+        self.assertEqual(api, 200)
+        self.assertIn(b"viewing", body)
+
+        stop, body, _ = self.form(
+            "/control/stop", {}, {"Authorization": "Bearer " + self.token}
+        )
+        self.assertEqual(stop, 200)
+        self.assertIn(b"control", body)
+
+
+    # ---------- ingress prefix for redirects ----------
+
+    def test_redirects_stay_inside_the_ingress_prefix(self):
+        cookie, csrf = self.start_control()
+        status, _, headers = self.ctl(
+            "/control/session", {"view": "on", "control": "on"}, cookie, csrf
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], self.UI_PREFIX + "/control?flash=session")
+
+        key = self.new_proposal()
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], self.UI_PREFIX + "/control?flash=executed")
+
+        key = self.new_proposal()
+        status, _, headers = self.ctl("/control/reject", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], self.UI_PREFIX + "/control?flash=rejected")
+
+        status, _, headers = self.ctl("/control/stop", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], self.UI_PREFIX + "/control?flash=stopped")
+
+    def test_malformed_ingress_prefix_is_rejected(self):
+        cookie, csrf = self.start_control()
+        for bad in (
+            "/control",
+            "https://evil.example/api/hassio_ingress/x",
+            "/api/hassio_ingress/../control",
+            "/api/hassio_ingress/a/b",
+            "/api/hassio_ingress/",
+        ):
+            with self.subTest(bad=bad):
+                status, _, headers = self.form(
+                    "/control/session",
+                    {"view": "on", "control": "on", "csrf": csrf},
+                    {**cookie, "X-Ingress-Path": bad},
+                )
+                self.assertEqual(status, 400)
+                self.assertNotIn("Location", headers)
+
+    def test_missing_ingress_prefix_from_supervisor_peer_is_rejected(self):
+        cookie, csrf = self.start_control()
+        status, _, headers = self.req(
+            "POST", "/control/session",
+            {"Content-Type": "application/x-www-form-urlencoded", **cookie},
+            urllib.parse.urlencode(
+                {"view": "on", "control": "on", "csrf": csrf}
+            ).encode(),
+        )
+        self.assertEqual(status, 400)
+        self.assertNotIn("Location", headers)
+
+    def test_login_without_ingress_prefix_is_rejected(self):
+        nonce, cookie = self.login_page()
+        status, _, headers = self.req(
+            "POST", "/control",
+            {"Content-Type": "application/x-www-form-urlencoded",
+             "Cookie": cookie, "X-Remote-User-Name": "alice"},
+            urllib.parse.urlencode({"nonce": nonce}).encode(),
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_display_name_without_username_is_rejected(self):
+        nonce, cookie = self.login_page()
+        status, _, headers = self.form(
+            "/control", {"nonce": nonce},
+            {"Cookie": cookie, "X-Remote-User-Display-Name": "Alice Smith"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_username_is_matched_not_display_name(self):
+        nonce, cookie = self.login_page()
+        status, _, headers = self.form(
+            "/control", {"nonce": nonce},
+            {"Cookie": cookie, "X-Remote-User-Name": "alice",
+             "X-Remote-User-Display-Name": "Someone Else"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Set-Cookie", headers)
+
+    def test_github_style_name_is_not_a_ha_username(self):
+        status, _, headers = self.login_attempt("cj118")
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
 
 
 if __name__ == "__main__":

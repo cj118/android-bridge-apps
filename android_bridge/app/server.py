@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -59,6 +59,7 @@ LOGIN_NONCE_TTL_SECONDS = 300
 # That single TCP peer is the only network evidence accepted for the
 # null/missing-origin exception. X-Forwarded-For is never trusted.
 INGRESS_PEERS = frozenset({"172.30.32.2"})
+_INGRESS_PATH_RE = re.compile(r"\A/api/hassio_ingress/[A-Za-z0-9_-]{1,64}\Z")
 _TRACKED_HEADERS = (
     "origin",
     "referer",
@@ -125,12 +126,11 @@ _CONTROL_LOGIN_HEAD = (
     "<title>Android Bridge - control sign in</title></head>"
     "<body style='font-family:system-ui;max-width:30rem;margin:3rem auto'>"
     "<h1>Control sign in</h1>"
-    "<p>Enter the bridge bearer token. It is never stored in the page.</p>"
     "<form method='post' action='control'>"
 )
 _CONTROL_LOGIN_TAIL = (
-    "<p><input name='token' type='password' size='46'></p>"
-    "<p><button type='submit'>Sign in</button></p>"
+    "<p>Sign-in uses your Home Assistant user. No token is entered here.</p>"
+    "<p><button type='submit'>Continue</button></p>"
     "</form></body></html>"
 )
 
@@ -242,6 +242,25 @@ def _create_token_file(path: str) -> bytes | None:
         except OSError:
             pass
     return token
+
+
+def load_allowed_users(data_dir: str = DEFAULT_DATA_DIR):
+    """Home Assistant usernames permitted to open the browser control session."""
+    path = os.path.join(data_dir, "options.json")
+    try:
+        with open(path, "rb") as handle:
+            options = json.loads(handle.read(65536))
+    except (OSError, ValueError):
+        return frozenset()
+    if not isinstance(options, dict):
+        return frozenset()
+    values = options.get("allowed_ha_users")
+    if not isinstance(values, list):
+        return frozenset()
+    return frozenset(
+        value.strip() for value in values
+        if isinstance(value, str) and value.strip()
+    )
 
 
 def load_or_create_token(data_dir: str = DEFAULT_DATA_DIR) -> bytes:
@@ -509,7 +528,9 @@ class Handler(BaseHTTPRequestHandler):
                 body, cookie = self._login_page()
                 self._send_html_with(body, {"Set-Cookie": cookie})
                 return
-            self._send_html(self._control_page(nonce))
+            query = urllib.parse.parse_qs(self.path.partition("?")[2])
+            flash = (query.get("flash") or [""])[0]
+            self._send_html(self._control_page(nonce, flash))
             return
 
         if path == "/status":
@@ -889,6 +910,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- POST ----------
 
     def do_POST(self):
+        self._browser_mode = False
         if len(self.path) > MAX_URI_LENGTH:
             self.close_connection = True
             self._send_json(414, {"error": "uri_too_long"})
@@ -959,6 +981,7 @@ class Handler(BaseHTTPRequestHandler):
                     and self._ui_csrf_ok(nonce, csrf)
                     and self._origin_error(nonce) is None
                 ):
+                    self._browser_mode = True
                     self._do_stop()
                     return
                 if self._authorized(fields.get("token")):
@@ -978,6 +1001,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._control_denied(blocked)
                 return
 
+            self._browser_mode = True
             if path == "/control/session":
                 self._do_session(fields)
             elif path == "/control/approve":
@@ -1121,6 +1145,146 @@ class Handler(BaseHTTPRequestHandler):
     def _from_ingress(self):
         return self._peer() in INGRESS_PEERS
 
+    def _ingress_prefix(self):
+        """Return the validated ingress prefix, '' if malformed, None if absent."""
+        raw = (self.headers.get("X-Ingress-Path") or "").strip()
+        if not raw:
+            return None
+        if not _INGRESS_PATH_RE.match(raw):
+            return ""
+        return raw
+
+    def _present_header_names(self):
+        names = [name for name in _TRACKED_HEADERS if self.headers.get(name) is not None]
+        return ",".join(names) if names else "none"
+
+    def _cookie_value(self, name):
+        for part in self.headers.get("Cookie", "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name and value:
+                return value
+        return None
+
+    def _login_page(self):
+        now = time.monotonic()
+        if len(self.server.login_nonces) > 64:
+            for key in [k for k, v in self.server.login_nonces.items() if v <= now]:
+                self.server.login_nonces.pop(key, None)
+        nonce = secrets.token_hex(16)
+        self.server.login_nonces[nonce] = time.monotonic() + LOGIN_NONCE_TTL_SECONDS
+        body = (
+            _CONTROL_LOGIN_HEAD
+            + "<input type='hidden' name='nonce' value='%s'>" % nonce
+            + _CONTROL_LOGIN_TAIL
+        ).encode("utf-8")
+        # Home Assistant rotates the ingress token, so the cookie is scoped to
+        # the stable ingress root rather than to one token-specific prefix.
+        if self._ingress_prefix():
+            path = "/api/hassio_ingress/"
+        else:
+            path = "/"
+        cookie = "ab_login=%s; Path=%s; HttpOnly; SameSite=Strict; Max-Age=%d" % (
+            nonce,
+            path,
+            LOGIN_NONCE_TTL_SECONDS,
+        )
+        return body, cookie
+
+    def _consume_login_nonce(self, fields):
+        value = (fields.get("nonce") or "").strip()
+        cookie = self._cookie_value("ab_login")
+        if not value or not cookie:
+            return False
+        if not hmac.compare_digest(value, cookie):
+            return False
+        expires = self.server.login_nonces.pop(value, None)
+        if expires is None or expires <= time.monotonic():
+            return False
+        return True
+
+    def _do_login(self, fields):
+        """Browser sign-in. Home Assistant identity only; the bearer is excluded."""
+        if not self._from_ingress():
+            self._login_denied("peer")
+            return
+        if not self._consume_login_nonce(fields):
+            self._login_denied("login_nonce")
+            return
+
+        user = (self.headers.get("X-Remote-User-Name") or "").strip()
+        if not user:
+            self._login_denied("ha_user_missing")
+            return
+        if user not in self.server.allowed_users:
+            self._login_denied("ha_user_not_allowed", user=user)
+            return
+
+        site = self.headers.get("Sec-Fetch-Site")
+        raw_origin = self.headers.get("Origin")
+        bound_origin = self._normalise_origin(raw_origin)
+        if bound_origin is not None and site is not None and site != "same-origin":
+            self._login_denied("sfs_not_same_origin")
+            return
+
+        prefix = self._ingress_prefix()
+        if prefix is None:
+            self._login_denied("ingress_path_missing")
+            return
+        if prefix == "":
+            self._login_denied("ingress_path_invalid")
+            return
+
+        nonce = secrets.token_hex(16)
+        csrf = hmac.new(
+            self.server.token, (nonce + ":csrf").encode("ascii"), "sha256"
+        ).hexdigest()[:32]
+        self.server.ui_sessions[nonce] = {
+            "expires": time.monotonic() + UI_SESSION_TTL_SECONDS,
+            "csrf": csrf,
+            "origin": bound_origin,
+            "user": user,
+        }
+        signature = hmac.new(
+            self.server.token, nonce.encode("ascii"), "sha256"
+        ).hexdigest()
+        cookie = "ab_ui=%s.%s; Path=%s/; HttpOnly; SameSite=Strict; Max-Age=%d" % (
+            nonce,
+            signature,
+            prefix,
+            int(UI_SESSION_TTL_SECONDS),
+        )
+        body = (
+            "<html><body style='font-family:system-ui;margin:2rem'>"
+            "<p>Signed in as <b>%s</b>.</p>"
+            "<p><a href='control'>Open control</a></p></body></html>"
+            % self._safe_text(user)
+        ).encode("utf-8")
+        self._send_html_with(body, {"Set-Cookie": cookie})
+
+    @staticmethod
+    def _safe_text(value):
+        return "".join(ch for ch in value if ch.isalnum() or ch in "._-@ ")[:64]
+
+    def _send_html_with(self, body, headers=None):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _peer(self):
+        address = self.client_address[0]
+        if address.startswith("::ffff:"):
+            address = address[7:]
+        return address
+
+    def _from_ingress(self):
+        return self._peer() in INGRESS_PEERS
+
     def _present_header_names(self):
         names = [name for name in _TRACKED_HEADERS if self.headers.get(name) is not None]
         return ",".join(names) if names else "none"
@@ -1169,57 +1333,6 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _do_login(self, fields):
-        if not self._require_auth(fields.get("token")):
-            return
-        raw_origin = self.headers.get("Origin")
-        bound_origin = self._normalise_origin(raw_origin)
-        site = self.headers.get("Sec-Fetch-Site")
-
-        if bound_origin is not None:
-            if site is not None and site != "same-origin":
-                self._login_denied("sfs_not_same_origin")
-                return
-        elif site == "same-origin":
-            bound_origin = None
-        elif site is None and self._from_ingress() and self._consume_login_nonce(fields):
-            bound_origin = None
-            sys.stderr.write(
-                "reason=origin_null_ingress_ok peer=%s\n" % self._peer()
-            )
-        else:
-            if self._from_ingress() and site is None:
-                self._login_denied("login_nonce")
-            else:
-                self._login_denied("origin_null")
-            return
-
-        nonce = secrets.token_hex(16)
-        csrf = hmac.new(
-            self.server.token, (nonce + ":csrf").encode("ascii"), "sha256"
-        ).hexdigest()[:32]
-        self.server.ui_sessions[nonce] = {
-            "expires": time.monotonic() + UI_SESSION_TTL_SECONDS,
-            "csrf": csrf,
-            "origin": bound_origin,
-        }
-        signature = hmac.new(
-            self.server.token, nonce.encode("ascii"), "sha256"
-        ).hexdigest()
-        prefix = self.headers.get("X-Ingress-Path", "").rstrip("/") or ""
-        cookie = "ab_ui=%s.%s; Path=%s/; HttpOnly; SameSite=Strict; Max-Age=%d" % (
-            nonce,
-            signature,
-            prefix,
-            int(UI_SESSION_TTL_SECONDS),
-        )
-        body = (
-            "<html><body style='font-family:system-ui;margin:2rem'>"
-            "<p>Signed in.</p><p><a href='control'>Open control</a></p>"
-            "</body></html>"
-        ).encode("utf-8")
-        self._send_html_with(body, {"Set-Cookie": cookie})
-
     def _do_session(self, fields):
         view = (fields.get("view") or "").strip().lower()
         ctl = (fields.get("control") or "").strip().lower()
@@ -1230,13 +1343,48 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.control_active = ctl == "on"
                 if ctl == "off":
                     self.server.approvals.clear()
-        self._send_json(
-            200,
+        self._respond(
             {
                 "viewing": self.server.viewing_active,
                 "control": self.server.control_active,
             },
+            flash="session",
         )
+
+    def _control_redirect(self, flash=None):
+        prefix = self._ingress_prefix()
+        if self._from_ingress():
+            if prefix is None:
+                sys.stderr.write(
+                    "redirect_blocked reason=ingress_path_missing peer=%s\n"
+                    % self._peer()
+                )
+                self._send_json(400, {"error": "ingress_path_missing"})
+                return
+            if prefix == "":
+                sys.stderr.write(
+                    "redirect_blocked reason=ingress_path_invalid peer=%s\n"
+                    % self._peer()
+                )
+                self._send_json(400, {"error": "ingress_path_invalid"})
+                return
+            location = prefix + "/control"
+        else:
+            location = "/control"
+        if flash:
+            location += "?flash=" + urllib.parse.quote(flash, safe="")
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _respond(self, payload, status=200, flash=None):
+        """Browsers get a redirect back to the panel; API clients get JSON."""
+        if getattr(self, "_browser_mode", False):
+            self._control_redirect(flash or ("ok" if status < 400 else "error"))
+        else:
+            self._send_json(status, payload)
 
     def _control_denied(self, reason):
         """Log which guard rejected the request. Header names only, no values."""
@@ -1252,17 +1400,17 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(AUTH_FAIL_DELAY_SECONDS)
         self._send_json(403, {"error": "forbidden"})
 
-    def _login_denied(self, reason):
-        """Reject sign-in. Header names only, never values or secrets."""
-        sys.stderr.write(
-            "login_forbidden reason=%s sfs=%s peer=%s hdrs=%s\n"
-            % (
-                reason,
-                self._log_site(self.headers.get("Sec-Fetch-Site")),
-                self._peer(),
-                self._present_header_names(),
-            )
+    def _login_denied(self, reason, user=None):
+        """Reject sign-in. Header names only; never tokens or cookie values."""
+        line = "login_forbidden reason=%s sfs=%s peer=%s hdrs=%s" % (
+            reason,
+            self._log_site(self.headers.get("Sec-Fetch-Site")),
+            self._peer(),
+            self._present_header_names(),
         )
+        if user:
+            line += " user=%s" % self._safe_text(user)
+        sys.stderr.write(line + "\n")
         time.sleep(AUTH_FAIL_DELAY_SECONDS)
         self._send_json(403, {"error": "forbidden"})
 
@@ -1270,7 +1418,7 @@ class Handler(BaseHTTPRequestHandler):
         with self.server.control_lock:
             self.server.control_active = False
             self.server.approvals.clear()
-        self._send_json(200, {"control": False, "pending": 0})
+        self._respond({"control": False, "pending": 0}, flash="stopped")
 
     def _end_sessions(self):
         with self.server.control_lock:
@@ -1282,16 +1430,16 @@ class Handler(BaseHTTPRequestHandler):
         key = (fields.get("id") or "").strip()
         with self.server.control_lock:
             if not self.server.control_active:
-                self._send_json(409, {"error": "control_inactive"})
+                self._respond({"error": "control_inactive"}, 409, flash="error")
                 return
             try:
                 record = self.server.approvals.approve(key)
             except control_actions.ActionError as exc:
-                self._send_json(409, {"error": str(exc)})
+                self._respond({"error": str(exc)}, 409, flash="error")
                 return
             if record["expires"] <= time.monotonic():
                 self.server.approvals.fail(key, "expired")
-                self._send_json(409, {"error": "approval expired"})
+                self._respond({"error": "approval expired"}, 409, flash="error")
                 return
             if (
                 control_actions.fingerprint(
@@ -1300,17 +1448,17 @@ class Handler(BaseHTTPRequestHandler):
                 != record["fingerprint"]
             ):
                 self.server.approvals.fail(key, "binding_mismatch")
-                self._send_json(409, {"error": "binding mismatch"})
+                self._respond({"error": "binding mismatch"}, 409, flash="error")
                 return
             _info, device = self._resolve_device()
             if device is None:
                 self.server.approvals.fail(key, "device_unavailable")
                 self._end_sessions()
-                self._send_json(409, {"error": "device_unavailable"})
+                self._respond({"error": "device_unavailable"}, 409, flash="error")
                 return
             if device["serial"] != record["device"]:
                 self.server.approvals.fail(key, "device_mismatch")
-                self._send_json(409, {"error": "device mismatch"})
+                self._respond({"error": "device mismatch"}, 409, flash="error")
                 return
             try:
                 adbctl.run_input(
@@ -1318,7 +1466,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             except adbctl.AdbError:
                 self.server.approvals.fail(key, "action_failed")
-                self._send_json(502, {"error": "action_failed"})
+                self._respond({"error": "action_failed"}, 502, flash="error")
                 return
 
         time.sleep(ACTION_SETTLE_SECONDS)
@@ -1327,23 +1475,31 @@ class Handler(BaseHTTPRequestHandler):
             pngcheck.validate(shot, max_bytes=MAX_CAPTURE_BYTES)
         except (adbctl.AdbError, pngcheck.PngError):
             self.server.approvals.complete(key, None, "executed_no_shot")
-            self._send_json(200, {"status": "executed", "screenshot": "unavailable"})
+            self._respond(
+                {"status": "executed", "screenshot": "unavailable"}, flash="executed"
+            )
             return
         self.server.approvals.complete(key, shot)
-        self._send_json(200, {"status": "executed"})
+        self._respond({"status": "executed"}, flash="executed")
 
     def _do_reject(self, fields):
         key = (fields.get("id") or "").strip()
         try:
             self.server.approvals.reject(key)
         except control_actions.ActionError as exc:
-            self._send_json(409, {"error": str(exc)})
+            self._respond({"error": str(exc)}, 409, flash="error")
             return
-        self._send_json(200, {"status": "rejected"})
+        self._respond({"status": "rejected"}, flash="rejected")
 
-    def _control_page(self, nonce):
+    def _control_page(self, nonce, flash=""):
         session = self.server.ui_sessions.get(nonce) or {}
         csrf = session.get("csrf", "")
+        flash_html = (
+            "<p style='padding:.5rem;background:#223;color:#cfe'>%s</p>"
+            % _safe_text(flash)
+            if flash
+            else ""
+        )
         pending = self.server.approvals.pending()
         cards = []
         for record in pending:
@@ -1377,6 +1533,7 @@ class Handler(BaseHTTPRequestHandler):
         body = (
             "<html><body style='font-family:system-ui;max-width:60rem;margin:2rem auto'>"
             "<h1>Android Bridge control</h1>"
+            "%s"
             "<p>Viewing session: <b>%s</b> &middot; Control session: <b>%s</b></p>"
             "<form method='post' action='control/session'>"
             "<input type='hidden' name='csrf' value='%s'>"
@@ -1387,6 +1544,7 @@ class Handler(BaseHTTPRequestHandler):
             "<button style='background:#a00;color:#fff;padding:.6rem 2rem'>STOP</button>"
             "</form><h2>Pending approvals</h2>%s</body></html>"
             % (
+                flash_html,
                 viewing,
                 control,
                 csrf,
@@ -1498,6 +1656,7 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.control_active = False
     server.ui_sessions = {}
     server.login_nonces = {}
+    server.allowed_users = load_allowed_users(data_dir)
     server.control_lock = threading.Lock()
     server.approvals = control_actions.Approvals()
     server.started_monotonic = time.monotonic()

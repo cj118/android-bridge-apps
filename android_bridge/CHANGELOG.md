@@ -1,5 +1,22 @@
 # Android Bridge changelog
 
+## 0.3.8
+
+- Browser sign-in is bound to the Home Assistant user, not the bearer token.
+  Supervisor ingress adds `X-Remote-User-Name` (and strips client-supplied
+  copies of the identity headers); a session is created only for a username in
+  the new `allowed_ha_users` option. The bearer token is API/MCP only and can
+  no longer create a browser session, approve actions or start control.
+- `panel_admin: true`.
+- Control-page POSTs answer `303` back to the panel; API and MCP clients still
+  receive JSON.
+- Redirects are built only from a validated `X-Ingress-Path`
+  (`/api/hassio_ingress/<token>`). A malformed or missing prefix is rejected
+  with `400`, so a redirect can never leave the ingress path. `Host` and
+  forwarding headers are never used.
+- Sign-in matches `X-Remote-User-Name` exactly against `allowed_ha_users`.
+  Display names and GitHub names are not accepted.
+
 ## 0.3.7
 
 - Home Assistant ingress supplies neither `Origin` nor `Sec-Fetch-Site` to the
