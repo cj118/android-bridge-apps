@@ -1120,6 +1120,99 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertEqual(info["serial"], "192.168.1.50:41234")
         self.assertEqual(info["model"], "SM_X210")
 
+    # ---------- connect saved tablet (no pairing) ----------
+
+    def test_connect_saved_reconnects_without_pairing_and_saves_identity(self):
+        cookie, csrf = self.start_control()
+        status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            headers["Location"], self.UI_PREFIX + "/control?flash=reconnected"
+        )
+        log = self.adb_log()
+        self.assertIn("['connect', '192.168.1.50:41234']", log)
+        self.assertNotIn("'pair'", log)
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["serial"], "192.168.1.50:41234")
+        self.assertEqual(info["model"], "SM_X210")
+        self.assertTrue(self.server.viewing_active)
+        self.assertTrue(self.server.control_active)
+
+    def test_connect_saved_requires_ui_session_and_csrf(self):
+        status, _, _ = self.form("/control/reconnect", {})
+        self.assertEqual(status, 403)
+        cookie, _csrf = self.login()
+        status, _, _ = self.form("/control/reconnect", {}, cookie)
+        self.assertEqual(status, 403)
+        status, _, _ = self.req(
+            "POST", "/control/reconnect",
+            {"Content-Type": "application/x-www-form-urlencoded",
+             "Authorization": "Bearer " + self.token},
+            b"",
+        )
+        self.assertEqual(status, 403)
+
+    def test_connect_saved_rejects_a_foreign_origin(self):
+        cookie, csrf = self.start_control()
+        status, _, _ = self.ctl(
+            "/control/reconnect", {}, cookie, csrf,
+            origin="https://evil.example",
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'connect'", self.adb_log())
+
+    def test_connect_saved_refuses_conflicting_identity(self):
+        cookie, csrf = self.start_control()
+        bridge.save_device(
+            self.data_dir, "192.168.1.50", "41234",
+            {"serial": "192.168.1.50:41234", "model": "SM-T870"},
+        )
+        path = bridge.device_path(self.data_dir)
+        with open(path, "rb") as handle:
+            before = handle.read()
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnect_failed", headers["Location"])
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertIn(
+            "saved_connect_failed reason=identity_conflict", capture.getvalue()
+        )
+        self.assertIn("['disconnect', '192.168.1.50:41234']", self.adb_log())
+
+    def test_connect_saved_fails_when_identity_cannot_be_read(self):
+        cookie, csrf = self.start_control()
+        os.environ["FAKE_ADB_MODEL"] = ""
+        self.addCleanup(os.environ.pop, "FAKE_ADB_MODEL", None)
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnect_failed", headers["Location"])
+        self.assertIn(
+            "saved_connect_failed reason=identity_unverified", capture.getvalue()
+        )
+        info = bridge.load_device(self.data_dir)
+        self.assertNotIn("serial", info)
+        self.assertNotIn("model", info)
+
+    def test_connect_saved_without_a_saved_device(self):
+        cookie, csrf = self.start_control()
+        os.unlink(bridge.device_path(self.data_dir))
+        status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnect_failed", headers["Location"])
+        self.assertNotIn("'connect'", self.adb_log())
+
+    def test_panel_offers_connect_saved(self):
+        cookie, _csrf = self.login()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Connect saved tablet", page)
+        self.assertIn(b"192.168.1.50:41234", page)
+
     def test_pair_rejects_bad_host_port_and_code(self):
         cookie, csrf = self.start_control()
         base = {"host": "192.168.1.50", "pairing_port": "37123",

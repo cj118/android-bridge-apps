@@ -1,5 +1,25 @@
 # Android Bridge changelog
 
+## 0.3.15
+
+- New `Connect saved tablet` button on the control panel. It reconnects to the
+  host and connect port already stored in `device.json`; no pairing code and no
+  repeated wireless-ADB pairing are needed.
+- The request uses the existing Home Assistant user session, CSRF token and
+  origin checks. A bearer token alone, a missing session or a missing CSRF token
+  is refused exactly as for the other control actions.
+- After connecting, the tablet's serial and `ro.product.model` are read and
+  must match any saved identity. The verified identity is then saved, so a
+  record created before identities existed gains one.
+- An unreadable identity, an ambiguous device listing, or an identity that
+  conflicts with the saved serial/model fails safely and leaves `device.json`
+  unchanged. A tablet connected during a failed verification is disconnected,
+  because the other paths resolve the saved target by host only.
+- When no tablet is saved the panel shows `No saved tablet.` instead of the
+  button.
+- Viewing, control, approval, STOP and the MCP source/Viewing gates are
+  unchanged.
+
 ## 0.3.14
 
 - Automatic reconnect to the saved tablet. At startup, after the adb key check,
