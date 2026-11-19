@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.8"
+VERSION = "0.3.9"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -245,16 +245,27 @@ def _create_token_file(path: str) -> bytes | None:
 
 
 def load_allowed_users(data_dir: str = DEFAULT_DATA_DIR):
-    """Home Assistant usernames permitted to open the browser control session."""
-    path = os.path.join(data_dir, "options.json")
+    """Home Assistant usernames permitted to open the browser control session.
+
+    Reads only the private handoff written at startup by options_bridge.py.
+    /data/options.json is Supervisor-managed, root-only, and never read here.
+    """
+    path = os.path.join(private_dir(data_dir), "allowed_users.json")
     try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return frozenset()
+        if info.st_uid != os.geteuid():
+            return frozenset()
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            return frozenset()
         with open(path, "rb") as handle:
-            options = json.loads(handle.read(65536))
+            data = json.loads(handle.read(65536))
     except (OSError, ValueError):
         return frozenset()
-    if not isinstance(options, dict):
+    if not isinstance(data, dict):
         return frozenset()
-    values = options.get("allowed_ha_users")
+    values = data.get("allowed_ha_users")
     if not isinstance(values, list):
         return frozenset()
     return frozenset(

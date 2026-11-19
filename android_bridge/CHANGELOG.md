@@ -1,5 +1,17 @@
 # Android Bridge changelog
 
+## 0.3.9
+
+- Fix: `/data/options.json` is Supervisor-managed and readable only by root, so
+  the unprivileged server could never load `allowed_ha_users` (the live symptom
+  was `login_forbidden reason=ha_user_not_allowed user=carlj`).
+- A root-only startup step (`options_bridge.py`) now extracts **only**
+  `allowed_ha_users` into `/data/private/allowed_users.json`, written atomically
+  with mode 0600 and owned by the application user 10001. No other option,
+  token or credential is copied, and `options.json` is never made readable.
+- The server reads only that private handoff and fails closed when it is
+  missing, malformed, loosely permissioned or owned by another user.
+
 ## 0.3.8
 
 - Browser sign-in is bound to the Home Assistant user, not the bearer token.
