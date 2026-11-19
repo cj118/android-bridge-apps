@@ -28,7 +28,7 @@ import control as control_actions
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.16"
+VERSION = "0.3.17"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -387,21 +387,23 @@ def save_device(data_dir: str, host: str, connect_port: str, identity=None) -> N
 
 
 def capture_identity(device, strict=False):
-    """Read the identity saved by a human-initiated panel connect.
+    """Read the hardware identity saved by a human-initiated panel connect.
 
-    Falls back to what the device listing reported, so a connect is never
-    blocked by an identity read failure. A strict read is for reconnecting to
-    a saved tablet: if either identity value cannot be read, return None.
+    ro.serialno is the physical serial. The adb transport address is never
+    used as identity. A strict read is for reconnecting to a saved tablet: if
+    either identity value cannot be read, return None.
     """
-    serial = device.get("serial", "")
+    device = device or {}
+    transport = device.get("serial", "")
     model = device.get("model", "")
+    serial = ""
     try:
-        serial = adbctl.get_serialno(serial) or serial
+        serial = adbctl.get_hardware_serial(transport)
     except adbctl.AdbError:
         if strict:
             return None
     try:
-        read_model = adbctl.get_model(serial)
+        read_model = adbctl.get_model(transport)
     except adbctl.AdbError:
         if strict:
             return None
@@ -410,16 +412,24 @@ def capture_identity(device, strict=False):
         model = read_model
     elif strict:
         return None
-    if strict and (not serial.strip() or not model.strip()):
+    if strict and (not serial or not (model or "").strip()):
         return None
-    return {"serial": serial, "model": model}
+    identity = {}
+    if serial:
+        identity["serial"] = serial
+    if model:
+        identity["model"] = model
+    return identity
 
 
 def same_model(left, right):
-    """Compare model names the same way the reconnector does."""
-    return (left or "").strip().replace("_", " ").lower() == (
-        right or ""
-    ).strip().replace("_", " ").lower()
+    """Compare model names with hyphens and underscores equivalent."""
+    def normalise(value):
+        value = (value or "").strip().lower()
+        value = value.replace("-", " ").replace("_", " ")
+        return " ".join(value.split())
+
+    return normalise(left) == normalise(right)
 
 
 # ---------------------------------------------------------------- self-test
@@ -1882,17 +1892,22 @@ class Handler(BaseHTTPRequestHandler):
         identity = (
             capture_identity(device, strict=True) if device is not None else None
         )
+        saved_serial = (info.get("serial") or "").strip()
+        saved_verified = adbctl.is_hardware_serial(saved_serial)
+        saved_model = info.get("model")
         error = None
         if identity is None:
             error = "identity_unverified"
-        else:
-            saved_serial = info.get("serial")
-            saved_model = info.get("model")
-            if saved_serial and identity["serial"] != saved_serial:
+        elif saved_verified:
+            if identity["serial"] != saved_serial:
                 error = "identity_conflict"
             elif saved_model and not same_model(identity["model"], saved_model):
                 error = "identity_conflict"
-            elif not saved_serial and not same_model(
+        else:
+            # Legacy record: no serial, or an old transport-address serial.
+            if saved_model and not same_model(identity["model"], saved_model):
+                error = "identity_conflict"
+            elif not same_model(
                 identity["model"], reconnect_module.LEGACY_UNVERIFIED_MODEL
             ):
                 error = "identity_unverified"
@@ -1907,11 +1922,14 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("saved_connect_failed reason=%s\n" % error)
             self._respond({"error": error}, 409, flash="reconnect_failed")
             return
-        try:
-            save_device(self.server.data_dir, host, port, identity)
-        except OSError:
-            self._send_json(500, {"error": "state_write_failed"})
-            return
+        if not saved_verified:
+            # A human-initiated panel reconnect may enrol a legacy record, but
+            # never overwrite an already verified hardware identity.
+            try:
+                save_device(self.server.data_dir, host, port, identity)
+            except OSError:
+                self._send_json(500, {"error": "state_write_failed"})
+                return
         self._respond({"status": "connected"}, flash="reconnected")
 
     def _do_disconnect(self):

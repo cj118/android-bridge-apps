@@ -30,6 +30,16 @@ log = os.environ.get("FAKE_ADB_LOG")
 if log:
     with open(log, "a") as fh:
         fh.write(repr(args) + "\n")
+server = os.environ.get("FAKE_ADB_SERVER", "ok")
+if args and args[0] == "start-server":
+    if server == "down":
+        sys.stderr.write("error: cannot connect to daemon at tcp:localhost:5037: failed to start daemon\n")
+        sys.exit(1)
+    print("* daemon started successfully")
+    sys.exit(0)
+if server == "down":
+    sys.stderr.write("error: cannot connect to daemon at tcp:localhost:5037\n")
+    sys.exit(1)
 if args and args[0] == "devices":
     print("List of devices attached")
     print(os.environ.get("FAKE_ADB_SERIAL", "192.168.1.50:41234") + "\tdevice product:x model:SM_X210 device:y")
@@ -53,7 +63,10 @@ if "-s" in args and "get-serialno" in args:
     print(os.environ.get("FAKE_ADB_SERIAL", "192.168.1.50:41234"))
     sys.exit(0)
 if "-s" in args and "getprop" in args:
-    print(os.environ.get("FAKE_ADB_MODEL", "SM_X210"))
+    if args[-1] == "ro.serialno":
+        print(os.environ.get("FAKE_ADB_HW_SERIAL", "R5CT12345678"))
+    else:
+        print(os.environ.get("FAKE_ADB_MODEL", "SM_X210"))
     sys.exit(0)
 if "-s" in args and "exec-out" in args:
     with open(os.environ["FAKE_ADB_PNG"], "rb") as fh:
@@ -167,6 +180,10 @@ class ControlSecurityTests(unittest.TestCase):
         self.server.approvals.clear()
         self.server.capture_times.clear()
         os.environ["FAKE_ADB_SERIAL"] = "192.168.1.50:41234"
+        os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT12345678"
+        os.environ["FAKE_ADB_MODEL"] = "SM_X210"
+        os.environ["FAKE_ADB_SERVER"] = "ok"
+        adbctl.reset_server_state()
         bridge.save_device(self.data_dir, "192.168.1.50", "41234")
         open(self.log_path, "w").close()
 
@@ -1150,7 +1167,7 @@ class ControlSecurityTests(unittest.TestCase):
         )
         self.assertEqual(status, 303)
         info = bridge.load_device(self.data_dir)
-        self.assertEqual(info["serial"], "192.168.1.50:41234")
+        self.assertEqual(info["serial"], "R5CT12345678")
         self.assertEqual(info["model"], "SM_X210")
 
     def test_connect_saves_the_device_identity(self):
@@ -1162,7 +1179,7 @@ class ControlSecurityTests(unittest.TestCase):
         )
         self.assertIn(status, (200, 303))
         info = bridge.load_device(self.data_dir)
-        self.assertEqual(info["serial"], "192.168.1.50:41234")
+        self.assertEqual(info["serial"], "R5CT12345678")
         self.assertEqual(info["model"], "SM_X210")
 
     # ---------- connect saved tablet (no pairing) ----------
@@ -1178,7 +1195,7 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIn("['connect', '192.168.1.50:41234']", log)
         self.assertNotIn("'pair'", log)
         info = bridge.load_device(self.data_dir)
-        self.assertEqual(info["serial"], "192.168.1.50:41234")
+        self.assertEqual(info["serial"], "R5CT12345678")
         self.assertEqual(info["model"], "SM_X210")
         self.assertTrue(self.server.viewing_active)
         self.assertTrue(self.server.control_active)
@@ -1437,6 +1454,138 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIn("['connect', '192.168.1.50:41234']", self.adb_log())
         self.assertNotIn("'pair'", self.adb_log())
 
+
+
+    # ---------- 0.3.17 physical identity ----------
+
+    def test_connect_saved_enrols_hardware_identity_from_transport_legacy_record(self):
+        cookie, csrf = self.start_control()
+        bridge.save_device(
+            self.data_dir, "192.168.1.50", "41234",
+            {"serial": "192.168.1.50:41234", "model": "SM_X210"},
+        )
+        status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnected", headers["Location"])
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["serial"], "R5CT12345678")
+        self.assertNotEqual(info["serial"], "192.168.1.50:41234")
+        self.assertEqual(info["model"], "SM_X210")
+
+    def test_connect_saved_does_not_overwrite_verified_hardware_identity(self):
+        cookie, csrf = self.start_control()
+        bridge.save_device(
+            self.data_dir, "192.168.1.50", "41234",
+            {"serial": "R5CT12345678", "model": "SM_X210"},
+        )
+        path = bridge.device_path(self.data_dir)
+        with open(path, "rb") as handle:
+            before = handle.read()
+        status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnected", headers["Location"])
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_connect_saved_refuses_hardware_serial_mismatch_byte_for_byte(self):
+        cookie, csrf = self.start_control()
+        bridge.save_device(
+            self.data_dir, "192.168.1.50", "41234",
+            {"serial": "R5CT00000000", "model": "SM_X210"},
+        )
+        path = bridge.device_path(self.data_dir)
+        with open(path, "rb") as handle:
+            before = handle.read()
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnect_failed", headers["Location"])
+        self.assertIn(
+            "saved_connect_failed reason=identity_conflict", capture.getvalue()
+        )
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_connect_saved_refuses_empty_or_address_like_ro_serialno(self):
+        cookie, csrf = self.start_control()
+        for value in ("", "192.168.1.50:41234"):
+            with self.subTest(value=value):
+                os.environ["FAKE_ADB_HW_SERIAL"] = value
+                adbctl.reset_server_state()
+                bridge.save_device(self.data_dir, "192.168.1.50", "41234")
+                path = bridge.device_path(self.data_dir)
+                with open(path, "rb") as handle:
+                    before = handle.read()
+                capture = io.StringIO()
+                with contextlib.redirect_stderr(capture):
+                    status, _, headers = self.ctl(
+                        "/control/reconnect", {}, cookie, csrf
+                    )
+                self.assertEqual(status, 303)
+                self.assertIn("flash=reconnect_failed", headers["Location"])
+                self.assertIn(
+                    "saved_connect_failed reason=identity_unverified",
+                    capture.getvalue(),
+                )
+                with open(path, "rb") as handle:
+                    self.assertEqual(handle.read(), before)
+        os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT12345678"
+
+    def test_connect_saved_accepts_samsung_model_with_hyphen(self):
+        cookie, csrf = self.start_control()
+        bridge.save_device(
+            self.data_dir, "192.168.1.50", "41234",
+            {"model": "SM_X210"},
+        )
+        os.environ["FAKE_ADB_MODEL"] = "SM-X210"
+        self.addCleanup(os.environ.__setitem__, "FAKE_ADB_MODEL", "SM_X210")
+        status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnected", headers["Location"])
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["serial"], "R5CT12345678")
+
+
+
+    def test_connect_saved_reproduces_real_samsung_adb_responses(self):
+        cookie, csrf = self.start_control()
+        os.environ["FAKE_ADB_SERIAL"] = "192.168.18.34:46337"
+        os.environ["FAKE_ADB_MODEL"] = "SM-X210"
+        os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT12345678"
+        bridge.save_device(self.data_dir, "192.168.18.34", "46337")
+        status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnected", headers["Location"])
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["serial"], "R5CT12345678")
+        self.assertNotEqual(info["serial"], "192.168.18.34:46337")
+        self.assertEqual(info["model"], "SM-X210")
+        log = self.adb_log()
+        self.assertIn("['connect', '192.168.18.34:46337']", log)
+        self.assertNotIn("'pair'", log)
+        self.assertNotIn("'get-serialno'", log)
+
+
+    def test_connect_saved_reports_daemon_failure_not_connection_refused(self):
+        cookie, csrf = self.start_control()
+        os.environ["FAKE_ADB_SERVER"] = "down"
+        adbctl.reset_server_state()
+        path = bridge.device_path(self.data_dir)
+        with open(path, "rb") as handle:
+            before = handle.read()
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, headers = self.ctl("/control/reconnect", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=reconnect_failed", headers["Location"])
+        output = capture.getvalue()
+        self.assertIn(
+            "saved_connect_failed reason=adb_server_unavailable", output
+        )
+        self.assertNotIn("connection_refused", output)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
 
 
 if __name__ == "__main__":

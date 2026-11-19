@@ -10,17 +10,24 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 
 ADB_BINARY = os.environ.get("BRIDGE_ADB_BINARY", "adb")
 DEFAULT_TIMEOUT = 20.0
 PAIR_TIMEOUT = 30.0
 IDENTITY_TIMEOUT = 5.0
+SERVER_TIMEOUT = 10.0
 MAX_OUTPUT_BYTES = 12 * 1024 * 1024
+_SERVER_LOCK = threading.Lock()
+_server_ready = False
 
 _HOST_RE = re.compile(r"\A[A-Za-z0-9.-]{1,253}\Z")
 _PORT_RE = re.compile(r"\A[0-9]{1,5}\Z")
 _CODE_RE = re.compile(r"\A[0-9]{6}\Z")
 _SERIAL_RE = re.compile(r"\A[^\s]{1,128}\Z")
+_TRANSPORT_RE = re.compile(r"\A[A-Za-z0-9.-]{1,253}:[0-9]{1,5}\Z")
+_HARDWARE_SERIAL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_SERIAL_PLACEHOLDERS = frozenset({"unknown", "null", "none", "n/a", "unavailable"})
 
 
 class AdbError(RuntimeError):
@@ -36,6 +43,20 @@ def classify_error(stderr: bytes) -> str:
     text = (stderr or b"").decode("utf-8", "replace").lower()
     if "adbkey" in text and "permission denied" in text:
         return "key_unreadable"
+    if any(
+        marker in text
+        for marker in (
+            "cannot connect to daemon",
+            "failed to start daemon",
+            "daemon not running",
+            "adb server didn't ack",
+            "adb server is out of date",
+            "could not install *smartsocket*",
+            "failed to connect to adb server",
+            "cannot start server",
+        )
+    ):
+        return "adb_server_unavailable"
     if "protocol fault" in text:
         return "protocol_fault"
     if (
@@ -91,6 +112,41 @@ def _serial(value: str) -> str:
     return value
 
 
+def is_transport_address(value: str) -> bool:
+    """True for an adb host:port transport identifier (never a hardware ID)."""
+    value = (value or "").strip()
+    if not value:
+        return False
+    if _TRANSPORT_RE.match(value):
+        return True
+    parts = value.split(".")
+    if len(parts) == 4 and all(part.isdigit() for part in parts):
+        return all(0 <= int(part) <= 255 for part in parts)
+    return False
+
+
+def is_hardware_serial(value: str) -> bool:
+    """True only for a plausible physical serial, never a transport address."""
+    value = (value or "").strip()
+    if not value or value.lower() in _SERIAL_PLACEHOLDERS:
+        return False
+    if is_transport_address(value):
+        return False
+    return bool(_HARDWARE_SERIAL_RE.match(value))
+
+
+def _mark_server_down() -> None:
+    global _server_ready
+    _server_ready = False
+
+
+def reset_server_state() -> None:
+    """Forget the cached daemon state (tests and explicit re-init)."""
+    global _server_ready
+    with _SERVER_LOCK:
+        _server_ready = False
+
+
 def _run(args, timeout=DEFAULT_TIMEOUT, stdin_data=None, max_bytes=MAX_OUTPUT_BYTES):
     command = [ADB_BINARY] + list(args)
     try:
@@ -115,7 +171,37 @@ def _run(args, timeout=DEFAULT_TIMEOUT, stdin_data=None, max_bytes=MAX_OUTPUT_BY
 
     if len(out) > max_bytes:
         raise AdbError("output too large")
+    if process.returncode != 0 and classify_error(_err) == "adb_server_unavailable":
+        _mark_server_down()
     return process.returncode, out, _err
+
+
+def ensure_server(timeout: float = SERVER_TIMEOUT) -> None:
+    """Start the ADB server once, serialised, before server-dependent work.
+
+    The client runs as the same unprivileged application user with the same
+    HOME, key store and environment as every other adb call. A daemon failure
+    is a distinct category from a tablet connection failure.
+    """
+    global _server_ready
+    with _SERVER_LOCK:
+        if _server_ready:
+            return
+        try:
+            returncode, _out, _err = _run(
+                ["start-server"], timeout=timeout, max_bytes=65536
+            )
+        except AdbError as exc:
+            _server_ready = False
+            if str(exc) == "timeout":
+                raise AdbError(
+                    "adb server unavailable", "adb_server_unavailable"
+                ) from None
+            raise
+        if returncode != 0:
+            _server_ready = False
+            raise AdbError("adb server unavailable", "adb_server_unavailable")
+        _server_ready = True
 
 
 def pair(host: str, port: str, code: str, timeout: float = PAIR_TIMEOUT) -> None:
@@ -124,6 +210,7 @@ def pair(host: str, port: str, code: str, timeout: float = PAIR_TIMEOUT) -> None
     code = (code or "").strip()
     if not _CODE_RE.match(code):
         raise AdbError("invalid pairing code")
+    ensure_server()
     returncode, _out, err = _run(
         ["pair", target],
         timeout=timeout,
@@ -136,6 +223,7 @@ def pair(host: str, port: str, code: str, timeout: float = PAIR_TIMEOUT) -> None
 
 def connect(host: str, port: str, timeout: float = DEFAULT_TIMEOUT) -> None:
     target = "%s:%s" % (_host(host), _port(port))
+    ensure_server()
     returncode, out, err = _run(["connect", target], timeout=timeout, max_bytes=65536)
     if returncode != 0 or b"connected" not in out.lower():
         raise AdbError("connect failed", classify_error(err) if returncode != 0 else "connection_refused")
@@ -168,11 +256,13 @@ def version(timeout: float = 5.0):
 
 
 def disconnect(serial: str, timeout: float = 10.0) -> None:
+    ensure_server()
     _run(["disconnect", _serial(serial)], timeout=timeout, max_bytes=65536)
 
 
 def list_devices(timeout: float = 10.0):
     """Return [{'serial': str, 'model': str}] for devices in state 'device'."""
+    ensure_server()
     returncode, out, _err = _run(["devices", "-l"], timeout=timeout, max_bytes=65536)
     if returncode != 0:
         raise AdbError("device list failed")
@@ -194,21 +284,25 @@ def list_devices(timeout: float = 10.0):
     return devices
 
 
-def get_serialno(serial: str, timeout: float = IDENTITY_TIMEOUT) -> str:
-    """Return the device's adb serial. Fixed command, no caller arguments."""
+def get_hardware_serial(serial: str, timeout: float = IDENTITY_TIMEOUT) -> str:
+    """Read ro.serialno. Fixed, read-only property; never the transport address."""
+    ensure_server()
     returncode, out, _err = _run(
-        ["-s", _serial(serial), "get-serialno"], timeout=timeout, max_bytes=4096
+        ["-s", _serial(serial), "shell", "getprop", "ro.serialno"],
+        timeout=timeout,
+        max_bytes=4096,
     )
     if returncode != 0:
         raise AdbError("identity unavailable")
     value = out.decode("utf-8", "replace").strip()
-    if not _SERIAL_RE.match(value):
+    if not is_hardware_serial(value):
         raise AdbError("identity unavailable")
     return value
 
 
 def get_model(serial: str, timeout: float = IDENTITY_TIMEOUT) -> str:
     """Read ro.product.model. Fixed, read-only property; no caller arguments."""
+    ensure_server()
     returncode, out, _err = _run(
         ["-s", _serial(serial), "shell", "getprop", "ro.product.model"],
         timeout=timeout,
@@ -221,6 +315,7 @@ def get_model(serial: str, timeout: float = IDENTITY_TIMEOUT) -> str:
 
 def screencap(serial: str, timeout: float = DEFAULT_TIMEOUT):
     """Fixed capture command. No arguments come from the caller."""
+    ensure_server()
     returncode, out, _err = _run(
         ["-s", _serial(serial), "exec-out", "screencap", "-p"],
         timeout=timeout,
@@ -242,6 +337,7 @@ def run_input(args, timeout: float = 15.0):
         or args[4] not in ("tap", "swipe", "text")
     ):
         raise AdbError("rejected input command")
+    ensure_server()
     returncode, _out, _err = _run(args, timeout=timeout, max_bytes=65536)
     if returncode != 0:
         raise AdbError("input failed")

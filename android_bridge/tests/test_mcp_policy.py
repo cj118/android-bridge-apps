@@ -28,6 +28,9 @@ log = os.environ.get("FAKE_ADB_LOG")
 if log:
     with open(log, "a") as fh:
         fh.write(repr(args) + "\n")
+if args and args[0] == "start-server":
+    print("* daemon started successfully")
+    sys.exit(0)
 if args and args[0] == "devices":
     print("List of devices attached")
     print(os.environ.get("FAKE_ADB_SERIAL", "192.168.1.50:41234")
@@ -72,6 +75,7 @@ class McpPolicyTests(unittest.TestCase):
         adbctl.ADB_BINARY = self.adb
         self._orig_source = bridge.mcp_source_allowed
         bridge.mcp_source_allowed = lambda address: address == "127.0.0.1"
+        adbctl.reset_server_state()
         self._saved_env = {
             key: os.environ.get(key)
             for key in ("FAKE_ADB_LOG", "FAKE_ADB_SERIAL", "FAKE_ADB_PNG")
@@ -160,7 +164,7 @@ class McpPolicyTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["serverInfo"]["name"], "android-bridge")
-        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.3.16")
+        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.3.17")
 
     def test_12_allowlisted_tools_list_with_viewing_off(self):
         server = self.start()

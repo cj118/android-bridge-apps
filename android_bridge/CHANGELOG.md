@@ -1,5 +1,30 @@
 # Android Bridge changelog
 
+## 0.3.17
+
+- Initialise the ADB server explicitly before server-dependent operations.
+  `adb start-server` runs as the existing unprivileged application user with
+  the existing HOME, key store and environment, under a short bounded timeout
+  and a single-flight lock. Daemon failures are reported as
+  `adb_server_unavailable`, never as a tablet `connection_refused`.
+- Save the physical tablet identity from `adb -s <transport> shell getprop
+  ro.serialno` instead of `adb get-serialno`, which returns the wireless
+  transport address. Empty, unavailable, malformed and address-like serials are
+  refused and never saved. The transport address is kept separate.
+- Treat a saved transport address, or a missing serial, as a legacy unverified
+  record. Only a human-initiated panel connection may enrol a hardware serial.
+  A previously verified hardware identity is never overwritten, and a mismatch
+  leaves `device.json` byte-for-byte unchanged.
+- Compare models with surrounding whitespace trimmed, case-insensitively, and
+  with hyphens and underscores equivalent, so `SM-X210` and `SM_X210` match.
+  Genuinely different models still fail.
+- Startup, lazy, panel, pairing, status and screenshot paths all use the same
+  ADB server and identity rules. Failure never prevents the bridge starting.
+- Regression tests cover daemon start/failure classification, single-flight
+  startup, the application environment, physical-serial validation, legacy
+  enrolment, verified-identity preservation, model normalisation, Viewing
+  gates and the read-only default tool set.
+
 ## 0.3.16
 
 - Fix the Device panel's reconnect form markup. The saved-form fragment was

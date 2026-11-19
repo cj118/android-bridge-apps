@@ -1,7 +1,7 @@
 """Bounded reconnection to the saved wireless-ADB tablet.
 
 Only fixed ADB operations are used: `connect` to the saved target, a read-only
-device listing, and the two read-only identity reads (`get-serialno` and
+device listing, and the two read-only identity reads (`getprop ro.serialno` and
 `getprop ro.product.model`). Every value comes from /data/private/device.json
 and is validated before adb runs, so a corrupt file cannot reach the adb binary.
 The caller is already the unprivileged application user; this module never
@@ -31,11 +31,13 @@ LAZY_COOLDOWN_SECONDS = 30.0
 # only tablet this bridge was built for is the SM-X210, so that model is the
 # single weak check allowed until a human connect from the panel saves a real
 # identity.
-LEGACY_UNVERIFIED_MODEL = "SM_X210"
+LEGACY_UNVERIFIED_MODEL = "SM-X210"
 
 
 def _normalise_model(value):
-    return (value or "").strip().replace("_", " ").lower()
+    value = (value or "").strip().lower()
+    value = value.replace("-", " ").replace("_", " ")
+    return " ".join(value.split())
 
 
 class Reconnector:
@@ -73,11 +75,17 @@ class Reconnector:
         return self.backoff[min(index, len(self.backoff) - 1)]
 
     def _verify(self, info, device):
-        """Return (reason, unverified). reason None means the device is trusted."""
-        saved_serial = info.get("serial")
-        if saved_serial:
+        """Return (reason, unverified). reason None means the device is trusted.
+
+        A saved value is a hardware identity only when it is a plausible
+        physical serial. A missing serial, or a legacy host:port transport
+        address, is unverified data and must be re-enrolled by a human panel
+        connection.
+        """
+        saved_serial = (info.get("serial") or "").strip()
+        if adbctl.is_hardware_serial(saved_serial):
             try:
-                actual_serial = adbctl.get_serialno(
+                actual_serial = adbctl.get_hardware_serial(
                     device["serial"], timeout=adbctl.IDENTITY_TIMEOUT
                 )
                 actual_model = adbctl.get_model(
@@ -93,8 +101,9 @@ class Reconnector:
             ):
                 return "identity_mismatch", False
             return None, False
-        # Legacy record: no saved identity. Only the known tablet model is
-        # accepted, and the caller is told the check was weak.
+        # Legacy record: no hardware serial, or a transport address saved by an
+        # older build. Only the known tablet model is accepted, and the caller
+        # is told the check was weak.
         if (
             _normalise_model(device.get("model"))
             != _normalise_model(LEGACY_UNVERIFIED_MODEL)

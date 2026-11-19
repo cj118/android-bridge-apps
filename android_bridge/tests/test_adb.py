@@ -30,6 +30,9 @@ if log:
     with open(log, "a") as fh:
         fh.write(repr(args) + "\n")
 mode = os.environ.get("FAKE_ADB_MODE", "ok")
+if args and args[0] == "start-server":
+    print("* daemon started successfully")
+    sys.exit(0)
 if "shell" in args:
     sys.exit(9)
 if args and args[0] == "version":
@@ -119,6 +122,7 @@ class ScreenshotTests(unittest.TestCase):
     def setUp(self):
         self._orig_source = bridge.mcp_source_allowed
         bridge.mcp_source_allowed = lambda address: True
+        adbctl.reset_server_state()
         self.server.capture_times.clear()
         self.server.viewing_active = True
         self.server.viewing_expires = time.monotonic() + 3600
