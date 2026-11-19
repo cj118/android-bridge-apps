@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import errno
 import hmac
+import html
 import http.client
 import json
 import os
@@ -26,7 +27,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.9"
+VERSION = "0.3.10"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -59,6 +60,14 @@ LOGIN_NONCE_TTL_SECONDS = 300
 # That single TCP peer is the only network evidence accepted for the
 # null/missing-origin exception. X-Forwarded-For is never trusted.
 INGRESS_PEERS = frozenset({"172.30.32.2"})
+_FLASH_MESSAGES = {
+    "session": "Session updated.",
+    "executed": "Action approved and executed.",
+    "rejected": "Action rejected.",
+    "stopped": "STOP: control disabled and pending approvals cancelled.",
+    "ok": "Done.",
+    "error": "The action was not completed. Check the log.",
+}
 _INGRESS_PATH_RE = re.compile(r"\A/api/hassio_ingress/[A-Za-z0-9_-]{1,64}\Z")
 _TRACKED_HEADERS = (
     "origin",
@@ -507,7 +516,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._route_get()
         except Exception as exc:
-            sys.stderr.write("android-bridge: handler error: %s\n" % type(exc).__name__)
+            self._log_handler_error(exc)
             try:
                 self._send_json(500, {"error": "internal_error"})
             except Exception:
@@ -1397,6 +1406,26 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(status, payload)
 
+    def _log_handler_error(self, exc):
+        """Type, file and line only. Never request data, cookies or paths."""
+        traceback = exc.__traceback__
+        while traceback is not None and traceback.tb_next is not None:
+            traceback = traceback.tb_next
+        if traceback is None:
+            sys.stderr.write(
+                "android-bridge: handler error: %s\n" % type(exc).__name__
+            )
+            return
+        frame = traceback.tb_frame
+        sys.stderr.write(
+            "android-bridge: handler error: %s at %s:%d\n"
+            % (
+                type(exc).__name__,
+                os.path.basename(frame.f_code.co_filename),
+                traceback.tb_lineno,
+            )
+        )
+
     def _control_denied(self, reason):
         """Log which guard rejected the request. Header names only, no values."""
         sys.stderr.write(
@@ -1505,10 +1534,11 @@ class Handler(BaseHTTPRequestHandler):
     def _control_page(self, nonce, flash=""):
         session = self.server.ui_sessions.get(nonce) or {}
         csrf = session.get("csrf", "")
+        message = _FLASH_MESSAGES.get(flash, "")
         flash_html = (
             "<p style='padding:.5rem;background:#223;color:#cfe'>%s</p>"
-            % _safe_text(flash)
-            if flash
+            % html.escape(message)
+            if message
             else ""
         )
         pending = self.server.approvals.pending()

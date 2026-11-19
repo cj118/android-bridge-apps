@@ -939,5 +939,77 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertNotIn("Set-Cookie", headers)
 
 
+    # ---------- flash rendering after redirect ----------
+
+    def follow(self, location, cookie):
+        path = (
+            location[len(self.UI_PREFIX):]
+            if location.startswith(self.UI_PREFIX)
+            else location
+        )
+        return self.req("GET", path, cookie)
+
+    def test_following_redirects_renders_each_flash(self):
+        cookie, csrf = self.start_control()
+
+        status, _, headers = self.ctl(
+            "/control/session", {"view": "on", "control": "on"}, cookie, csrf
+        )
+        self.assertEqual(status, 303)
+        status, page, _ = self.follow(headers["Location"], cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Session updated", page)
+
+        key = self.new_proposal()
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        status, page, _ = self.follow(headers["Location"], cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"approved and executed", page)
+
+        key = self.new_proposal()
+        status, _, headers = self.ctl("/control/reject", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        status, page, _ = self.follow(headers["Location"], cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Action rejected", page)
+
+        status, _, headers = self.ctl("/control/stop", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        status, page, _ = self.follow(headers["Location"], cookie)
+        self.assertEqual(status, 200)
+        self.assertIn(b"STOP: control disabled", page)
+
+    def test_every_flash_value_renders(self):
+        cookie, _csrf = self.login()
+        for flash, expected in (
+            ("session", b"Session updated"),
+            ("executed", b"approved and executed"),
+            ("rejected", b"Action rejected"),
+            ("stopped", b"STOP: control disabled"),
+            ("ok", b"Done"),
+            ("error", b"not completed"),
+        ):
+            with self.subTest(flash=flash):
+                status, page, _ = self.req(
+                    "GET", "/control?flash=" + flash, cookie
+                )
+                self.assertEqual(status, 200)
+                self.assertIn(expected, page)
+
+    def test_unknown_flash_is_ignored_and_escaped(self):
+        cookie, _csrf = self.login()
+        status, page, _ = self.req(
+            "GET", "/control?flash=%3Cscript%3Ealert(1)%3C%2Fscript%3E", cookie
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"<script>", page)
+        self.assertNotIn(b"alert(1)", page)
+
+        status, page, _ = self.req("GET", "/control?flash=zzz", cookie)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"zzz", page)
+
+
 if __name__ == "__main__":
     unittest.main()

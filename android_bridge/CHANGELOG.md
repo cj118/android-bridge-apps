@@ -1,5 +1,14 @@
 # Android Bridge changelog
 
+## 0.3.10
+
+- Fix: the control page raised `NameError` while rendering a flash message
+  (`_safe_text` was called unqualified instead of `self._safe_text`), so every
+  `303` redirect ended in `GET /control?flash=... → 500`.
+- Flash text is now a fixed whitelist rendered through `html.escape`; unknown
+  values render nothing.
+- Handler errors log the exception type, file name and line number only.
+
 ## 0.3.9
 
 - Fix: `/data/options.json` is Supervisor-managed and readable only by root, so
