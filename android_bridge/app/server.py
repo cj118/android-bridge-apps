@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -54,6 +54,20 @@ MCP_ALLOWED_HOSTS = (
 )
 MCP_ALLOWLIST_TTL_SECONDS = 30.0
 UI_SESSION_TTL_SECONDS = 8 * 3600
+LOGIN_NONCE_TTL_SECONDS = 300
+# Home Assistant ingress reaches an app from the Supervisor at 172.30.32.2.
+# That single TCP peer is the only network evidence accepted for the
+# null/missing-origin exception. X-Forwarded-For is never trusted.
+INGRESS_PEERS = frozenset({"172.30.32.2"})
+_TRACKED_HEADERS = (
+    "origin",
+    "referer",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-dest",
+    "x-ingress-path",
+    "x-forwarded-for",
+)
 ACTION_SETTLE_SECONDS = 0.6
 _ALLOWLIST = {"ips": frozenset(), "at": 0.0}
 
@@ -106,17 +120,19 @@ _PAIR_PAGE = (
 ).encode("utf-8")
 
 
-_CONTROL_LOGIN = (
+_CONTROL_LOGIN_HEAD = (
     "<!doctype html><html><head><meta charset='utf-8'>"
     "<title>Android Bridge - control sign in</title></head>"
     "<body style='font-family:system-ui;max-width:30rem;margin:3rem auto'>"
     "<h1>Control sign in</h1>"
     "<p>Enter the bridge bearer token. It is never stored in the page.</p>"
     "<form method='post' action='control'>"
+)
+_CONTROL_LOGIN_TAIL = (
     "<p><input name='token' type='password' size='46'></p>"
     "<p><button type='submit'>Sign in</button></p>"
     "</form></body></html>"
-).encode("utf-8")
+)
 
 
 class TokenError(RuntimeError):
@@ -490,7 +506,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/control":
             nonce = self._ui_session()
             if not nonce:
-                self._send_html(_CONTROL_LOGIN)
+                body, cookie = self._login_page()
+                self._send_html_with(body, {"Set-Cookie": cookie})
                 return
             self._send_html(self._control_page(nonce))
             return
@@ -1063,13 +1080,18 @@ class Handler(BaseHTTPRequestHandler):
             return "origin_invalid"
 
         if raw is None or presented is None:
-            # Missing or "null": fetch metadata is the only proof available.
+            # Missing or "null": the browser gave no origin at all.
             if site == "same-origin":
+                return None
+            if site is None and self._from_ingress():
+                sys.stderr.write(
+                    "reason=origin_null_ingress_ok peer=%s\n" % self._peer()
+                )
                 return None
             return "origin_null"
 
-        if site == "cross-site":
-            return "cross_site"
+        if site is not None and site != "same-origin":
+            return "cross_site" if site == "cross-site" else "sfs_not_same_origin"
 
         session = self.server.ui_sessions.get(nonce) or {}
         bound = session.get("origin")
@@ -1090,18 +1112,86 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _peer(self):
+        address = self.client_address[0]
+        if address.startswith("::ffff:"):
+            address = address[7:]
+        return address
+
+    def _from_ingress(self):
+        return self._peer() in INGRESS_PEERS
+
+    def _present_header_names(self):
+        names = [name for name in _TRACKED_HEADERS if self.headers.get(name) is not None]
+        return ",".join(names) if names else "none"
+
+    def _cookie_value(self, name):
+        for part in self.headers.get("Cookie", "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name and value:
+                return value
+        return None
+
+    def _login_page(self):
+        now = time.monotonic()
+        if len(self.server.login_nonces) > 64:
+            for key in [k for k, v in self.server.login_nonces.items() if v <= now]:
+                self.server.login_nonces.pop(key, None)
+        nonce = secrets.token_hex(16)
+        self.server.login_nonces[nonce] = time.monotonic() + LOGIN_NONCE_TTL_SECONDS
+        body = (
+            _CONTROL_LOGIN_HEAD
+            + "<input type='hidden' name='nonce' value='%s'>" % nonce
+            + _CONTROL_LOGIN_TAIL
+        ).encode("utf-8")
+        # Home Assistant rotates the ingress token, so the cookie is scoped to
+        # the stable ingress root rather than to one token-specific prefix.
+        if self.headers.get("X-Ingress-Path"):
+            path = "/api/hassio_ingress/"
+        else:
+            path = "/"
+        cookie = "ab_login=%s; Path=%s; HttpOnly; SameSite=Strict; Max-Age=%d" % (
+            nonce,
+            path,
+            LOGIN_NONCE_TTL_SECONDS,
+        )
+        return body, cookie
+
+    def _consume_login_nonce(self, fields):
+        value = (fields.get("nonce") or "").strip()
+        cookie = self._cookie_value("ab_login")
+        if not value or not cookie:
+            return False
+        if not hmac.compare_digest(value, cookie):
+            return False
+        expires = self.server.login_nonces.pop(value, None)
+        if expires is None or expires <= time.monotonic():
+            return False
+        return True
+
     def _do_login(self, fields):
         if not self._require_auth(fields.get("token")):
             return
         raw_origin = self.headers.get("Origin")
         bound_origin = self._normalise_origin(raw_origin)
         site = self.headers.get("Sec-Fetch-Site")
-        if bound_origin is None and site != "same-origin":
+
+        if bound_origin is not None:
+            if site is not None and site != "same-origin":
+                self._login_denied("sfs_not_same_origin")
+                return
+        elif site == "same-origin":
+            bound_origin = None
+        elif site is None and self._from_ingress() and self._consume_login_nonce(fields):
+            bound_origin = None
             sys.stderr.write(
-                "login_forbidden reason=origin_null sfs=%s\n" % self._log_site(site)
+                "reason=origin_null_ingress_ok peer=%s\n" % self._peer()
             )
-            time.sleep(AUTH_FAIL_DELAY_SECONDS)
-            self._send_json(403, {"error": "forbidden"})
+        else:
+            if self._from_ingress() and site is None:
+                self._login_denied("login_nonce")
+            else:
+                self._login_denied("origin_null")
             return
 
         nonce = secrets.token_hex(16)
@@ -1149,10 +1239,29 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _control_denied(self, reason):
-        """Log which guard rejected the request. Never logs header values."""
+        """Log which guard rejected the request. Header names only, no values."""
         sys.stderr.write(
-            "control_forbidden reason=%s sfs=%s\n"
-            % (reason, self._log_site(self.headers.get("Sec-Fetch-Site")))
+            "control_forbidden reason=%s sfs=%s peer=%s hdrs=%s\n"
+            % (
+                reason,
+                self._log_site(self.headers.get("Sec-Fetch-Site")),
+                self._peer(),
+                self._present_header_names(),
+            )
+        )
+        time.sleep(AUTH_FAIL_DELAY_SECONDS)
+        self._send_json(403, {"error": "forbidden"})
+
+    def _login_denied(self, reason):
+        """Reject sign-in. Header names only, never values or secrets."""
+        sys.stderr.write(
+            "login_forbidden reason=%s sfs=%s peer=%s hdrs=%s\n"
+            % (
+                reason,
+                self._log_site(self.headers.get("Sec-Fetch-Site")),
+                self._peer(),
+                self._present_header_names(),
+            )
         )
         time.sleep(AUTH_FAIL_DELAY_SECONDS)
         self._send_json(403, {"error": "forbidden"})
@@ -1388,6 +1497,7 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.viewing_active = False
     server.control_active = False
     server.ui_sessions = {}
+    server.login_nonces = {}
     server.control_lock = threading.Lock()
     server.approvals = control_actions.Approvals()
     server.started_monotonic = time.monotonic()

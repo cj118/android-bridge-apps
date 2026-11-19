@@ -1,5 +1,17 @@
 # Android Bridge changelog
 
+## 0.3.7
+
+- Home Assistant ingress supplies neither `Origin` nor `Sec-Fetch-Site` to the
+  add-on. A missing or `null` origin is now accepted only from the Supervisor
+  ingress peer `172.30.32.2`, and only with a valid session plus the
+  session-bound CSRF token. `X-Forwarded-For` is never trusted.
+- Sign-in from such a peer requires a single-use, five-minute nonce issued with
+  the sign-in page and bound to its cookie. `null` is never stored as an origin.
+- Every 403 logs the names of the tracked headers that were present, plus the
+  peer address and fetch-site value. Values, cookies, CSRF tokens and ingress
+  paths are never logged.
+
 ## 0.3.6
 
 - Origin guard: an absent or `null` Origin is accepted only when

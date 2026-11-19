@@ -81,7 +81,11 @@ class ControlSecurityTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
+    def tearDown(self):
+        bridge.Handler._peer = self._orig_peer
+
     def setUp(self):
+        self._orig_peer = bridge.Handler._peer
         self.server.viewing_active = False
         self.server.control_active = False
         self.server.approvals.clear()
@@ -134,6 +138,18 @@ class ControlSecurityTests(unittest.TestCase):
         if sfs:
             headers["Sec-Fetch-Site"] = sfs
         return self.form(path, payload, headers)
+
+    def set_peer(self, address):
+        bridge.Handler._peer = lambda handler: address
+
+    def set_ingress(self, on=True):
+        self.set_peer("172.30.32.2" if on else "172.30.33.4")
+
+    def login_page(self):
+        status, page, headers = self.req("GET", "/control")
+        self.assertEqual(status, 200)
+        nonce = re.search(rb"name='nonce' value='([0-9a-f]+)'", page).group(1).decode()
+        return nonce, headers["Set-Cookie"].split(";", 1)[0]
 
     def login_null(self):
         """Session created from an opaque (null) origin, as the ingress does."""
@@ -574,6 +590,206 @@ class ControlSecurityTests(unittest.TestCase):
                  "Sec-Fetch-Site": "cross-site"},
             )
         self.assertIn("control_forbidden reason=cross_site", capture.getvalue())
+
+
+    # ---------- ingress peer (opaque origin, no fetch metadata) ----------
+
+    def _enter_control_without_headers(self):
+        """Sign in and enable control with no Origin and no Sec-Fetch-Site."""
+        self.set_ingress(True)
+        nonce, login_cookie = self.login_page()
+        status, _, headers = self.form(
+            "/control", {"token": self.token, "nonce": nonce},
+            {"Cookie": login_cookie},
+        )
+        self.assertEqual(status, 200)
+        cookie = {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
+        status, page, _ = self.req("GET", "/control", cookie)
+        csrf = re.search(rb"name='csrf' value='([0-9a-f]+)'", page).group(1).decode()
+        status, _, _ = self.form(
+            "/control/session", {"view": "on", "control": "on", "csrf": csrf},
+            cookie,
+        )
+        self.assertEqual(status, 200)
+        return cookie, csrf
+
+    def test_ingress_peer_without_origin_or_sfs_is_accepted(self):
+        cookie, csrf = self._enter_control_without_headers()
+        key = self.new_proposal()
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, _ = self.form(
+                "/control/approve", {"id": key, "csrf": csrf}, cookie
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("reason=origin_null_ingress_ok", capture.getvalue())
+        self.assertIn("'input'", self.adb_log())
+
+    def test_ingress_peer_without_csrf_is_rejected(self):
+        cookie, _csrf = self._enter_control_without_headers()
+        key = self.new_proposal()
+        status, _, _ = self.form("/control/approve", {"id": key}, cookie)
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_ingress_peer_without_session_is_rejected(self):
+        self.set_ingress(True)
+        status, _, _ = self.form(
+            "/control/approve", {"id": "deadbeef", "csrf": "0" * 32}, {}
+        )
+        self.assertEqual(status, 403)
+
+    def test_non_ingress_peer_without_origin_is_rejected(self):
+        cookie, csrf = self._enter_control_without_headers()
+        self.set_ingress(False)
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf}, cookie
+        )
+        self.assertEqual(status, 403)
+
+    def test_ingress_peer_with_cross_site_metadata_is_rejected(self):
+        cookie, csrf = self._enter_control_without_headers()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "null", "Sec-Fetch-Site": "cross-site"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_ingress_peer_with_mismatched_origin_is_rejected(self):
+        cookie, csrf = self._enter_control_without_headers()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "https://evil.example"},
+        )
+        self.assertEqual(status, 403)
+
+    # ---------- login nonce ----------
+
+    def test_login_with_nonce_from_ingress_is_accepted(self):
+        self.set_ingress(True)
+        nonce, login_cookie = self.login_page()
+        status, _, headers = self.form(
+            "/control", {"token": self.token, "nonce": nonce},
+            {"Cookie": login_cookie},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Set-Cookie", headers)
+
+    def test_login_without_nonce_is_rejected(self):
+        self.set_ingress(True)
+        status, _, headers = self.form("/control", {"token": self.token})
+        self.assertEqual(status, 403)
+        self.assertNotIn("Set-Cookie", headers)
+
+    def test_login_nonce_is_single_use(self):
+        self.set_ingress(True)
+        nonce, login_cookie = self.login_page()
+        first, _, _ = self.form(
+            "/control", {"token": self.token, "nonce": nonce},
+            {"Cookie": login_cookie},
+        )
+        self.assertEqual(first, 200)
+        second, _, _ = self.form(
+            "/control", {"token": self.token, "nonce": nonce},
+            {"Cookie": login_cookie},
+        )
+        self.assertEqual(second, 403)
+
+    def test_login_nonce_expires(self):
+        self.set_ingress(True)
+        nonce, login_cookie = self.login_page()
+        self.server.login_nonces[nonce] = time.monotonic() - 1
+        status, _, _ = self.form(
+            "/control", {"token": self.token, "nonce": nonce},
+            {"Cookie": login_cookie},
+        )
+        self.assertEqual(status, 403)
+
+    def test_rejection_log_lists_header_names_only(self):
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            self.form(
+                "/control/approve", {"id": "x", "csrf": "0" * 32},
+                {"Origin": "https://evil.example",
+                 "Sec-Fetch-Site": "cross-site",
+                 "Cookie": "ab_ui=totally-invalid"},
+            )
+        output = capture.getvalue()
+        self.assertIn("hdrs=", output)
+        self.assertIn("origin", output)
+        self.assertIn("sec-fetch-site", output)
+        self.assertNotIn("evil.example", output)
+        self.assertNotIn("totally-invalid", output)
+        self.assertNotIn(self.token, output)
+
+
+    # ---------- ingress peer must be exactly 172.30.32.2 ----------
+
+    def test_null_origin_rejected_from_core_peer(self):
+        cookie, csrf = self._enter_control_without_headers()
+        key = self.new_proposal()
+        self.set_peer("172.30.32.1")           # Home Assistant Core, not Supervisor
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf}, cookie
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_null_origin_rejected_from_arbitrary_peer(self):
+        cookie, csrf = self._enter_control_without_headers()
+        key = self.new_proposal()
+        self.set_peer("172.30.33.4")           # another add-on
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf}, cookie
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_forwarded_for_does_not_grant_ingress(self):
+        cookie, csrf = self._enter_control_without_headers()
+        key = self.new_proposal()
+        self.set_peer("172.30.33.9")
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "X-Forwarded-For": "172.30.32.2"},
+        )
+        self.assertEqual(status, 403)
+
+    def test_login_null_origin_rejected_from_non_supervisor_peer(self):
+        self.set_ingress(True)
+        nonce, login_cookie = self.login_page()
+        self.set_peer("172.30.32.1")
+        status, _, _ = self.form(
+            "/control", {"token": self.token, "nonce": nonce},
+            {"Cookie": login_cookie},
+        )
+        self.assertEqual(status, 403)
+
+    def test_login_cookie_is_scoped_to_ingress_root(self):
+        status, _, headers = self.req(
+            "GET", "/control", {"X-Ingress-Path": "/api/hassio_ingress/AAA111"}
+        )
+        self.assertEqual(status, 200)
+        cookie = headers.get("Set-Cookie", "")
+        self.assertIn("Path=/api/hassio_ingress/", cookie)
+        self.assertNotIn("AAA111", cookie)
+
+    def test_login_nonce_survives_a_changed_ingress_token(self):
+        status, page, headers = self.req(
+            "GET", "/control", {"X-Ingress-Path": "/api/hassio_ingress/AAA111"}
+        )
+        nonce = re.search(rb"name='nonce' value='([0-9a-f]+)'", page).group(1).decode()
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        self.set_ingress(True)
+        status, _, _ = self.form(
+            "/control", {"token": self.token, "nonce": nonce},
+            {"Cookie": cookie, "X-Ingress-Path": "/api/hassio_ingress/BBB222"},
+        )
+        self.assertEqual(status, 200)
 
 
 if __name__ == "__main__":
