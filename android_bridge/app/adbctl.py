@@ -13,6 +13,8 @@ import subprocess
 import threading
 
 ADB_BINARY = os.environ.get("BRIDGE_ADB_BINARY", "adb")
+ADB_HOME = "/data"
+ADB_USER_HOME = "/data/.android"
 DEFAULT_TIMEOUT = 20.0
 PAIR_TIMEOUT = 30.0
 IDENTITY_TIMEOUT = 5.0
@@ -147,6 +149,19 @@ def reset_server_state() -> None:
         _server_ready = False
 
 
+def _adb_env():
+    """One explicit environment for every adb subprocess.
+
+    HOME and ANDROID_USER_HOME must not depend on the caller's environment:
+    the app user's passwd entry or su-exec can otherwise point adb at a
+    non-existent /home/app and it aborts before using the existing key store.
+    """
+    env = os.environ.copy()
+    env["HOME"] = ADB_HOME
+    env["ANDROID_USER_HOME"] = ADB_USER_HOME
+    return env
+
+
 def _run(args, timeout=DEFAULT_TIMEOUT, stdin_data=None, max_bytes=MAX_OUTPUT_BYTES):
     command = [ADB_BINARY] + list(args)
     try:
@@ -155,6 +170,7 @@ def _run(args, timeout=DEFAULT_TIMEOUT, stdin_data=None, max_bytes=MAX_OUTPUT_BY
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=_adb_env(),
         )
     except OSError:
         raise AdbError("adb unavailable") from None
@@ -176,31 +192,53 @@ def _run(args, timeout=DEFAULT_TIMEOUT, stdin_data=None, max_bytes=MAX_OUTPUT_BY
     return process.returncode, out, _err
 
 
+def _start_server_client(timeout: float) -> None:
+    """Run and wait for the start-server client without holding a pipe open.
+
+    stdout/stderr go to DEVNULL so a detached daemon cannot inherit the pipe
+    and keep the client unreaped. The client itself is explicitly waited on.
+    """
+    try:
+        process = subprocess.Popen(
+            [ADB_BINARY, "start-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_adb_env(),
+        )
+    except OSError:
+        raise AdbError("adb unavailable") from None
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise AdbError(
+            "adb server unavailable", "adb_server_unavailable"
+        ) from None
+    if returncode != 0:
+        raise AdbError("adb server unavailable", "adb_server_unavailable")
+
+
 def ensure_server(timeout: float = SERVER_TIMEOUT) -> None:
     """Start the ADB server once, serialised, before server-dependent work.
 
-    The client runs as the same unprivileged application user with the same
-    HOME, key store and environment as every other adb call. A daemon failure
-    is a distinct category from a tablet connection failure.
+    The client runs as the same unprivileged application user with an explicit
+    HOME=/data and ANDROID_USER_HOME=/data/.android. A daemon failure is a
+    distinct category from a tablet connection failure.
     """
     global _server_ready
     with _SERVER_LOCK:
         if _server_ready:
             return
         try:
-            returncode, _out, _err = _run(
-                ["start-server"], timeout=timeout, max_bytes=65536
-            )
-        except AdbError as exc:
+            _start_server_client(timeout)
+        except AdbError:
             _server_ready = False
-            if str(exc) == "timeout":
-                raise AdbError(
-                    "adb server unavailable", "adb_server_unavailable"
-                ) from None
             raise
-        if returncode != 0:
-            _server_ready = False
-            raise AdbError("adb server unavailable", "adb_server_unavailable")
         _server_ready = True
 
 

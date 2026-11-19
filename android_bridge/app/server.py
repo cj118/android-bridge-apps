@@ -28,7 +28,7 @@ import control as control_actions
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.17"
+VERSION = "0.3.18"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -2085,6 +2085,7 @@ def main() -> int:
         return 1
 
     _log_adb_version()
+    sys.stderr.write("adb home=%s\n" % adbctl.ADB_HOME)
     _log_adb_key_state(DEFAULT_DATA_DIR)
     sys.stderr.write(
         "android-bridge %s listening on %d (HA-user panel, MCP source+viewing gate)\n"

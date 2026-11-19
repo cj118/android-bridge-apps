@@ -45,5 +45,9 @@ python3 /app/options_bridge.py \
     "$PRIVATE_DIR/allowed_users.json" \
     "$APP_UID" "$APP_GID" || true
 
+# adb must use the persistent data volume, not the passwd home /home/app.
+export HOME=/data
+export ANDROID_USER_HOME=/data/.android
+
 # The token and adbkey files are never touched here: chown follows symlinks.
 exec su-exec "$APP_UID:$APP_GID" python3 -u /app/server.py

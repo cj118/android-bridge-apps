@@ -12,7 +12,7 @@ COPY app/reconnect.py /app/reconnect.py
 COPY app/entrypoint.sh /entrypoint.sh
 
 RUN addgroup -g 10001 app \
- && adduser -D -H -u 10001 -G app app \
+ && adduser -D -H -h /data -u 10001 -G app app \
  && apk add --no-cache su-exec android-tools \
  && chmod 0755 /entrypoint.sh
 

@@ -1,5 +1,21 @@
 # Android Bridge changelog
 
+## 0.3.18
+
+- Run every adb subprocess with an explicit `HOME=/data` and
+  `ANDROID_USER_HOME=/data/.android`, independent of the parent environment.
+  The app user's passwd home is `/data` and the entrypoint exports both
+  variables, so adb no longer tries to create `/home/app/.android` and abort
+  before reading the existing key store.
+- Start the ADB server with stdin/stdout/stderr on DEVNULL and wait for the
+  client, so a detached daemon cannot hold a pipe open and leave defunct adb
+  children.
+- Log `adb home=/data` at startup (path only).
+- Regression tests assert the explicit environment even when the parent
+  `HOME` is `/home/app`, verify the start-server DEVNULL/wait contract, and
+  check that no unreaped child remains after start-server.
+- No security, identity or key-handling behaviour changed.
+
 ## 0.3.17
 
 - Initialise the ADB server explicitly before server-dependent operations.

@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -34,7 +35,11 @@ if log:
 envlog = os.environ.get("FAKE_ADB_ENV_LOG")
 if envlog:
     with open(envlog, "a") as fh:
-        fh.write("%s|%s\n" % (os.geteuid(), os.environ.get("HOME", "")))
+        fh.write("%s|%s|%s\n" % (
+            os.geteuid(),
+            os.environ.get("HOME", ""),
+            os.environ.get("ANDROID_USER_HOME", ""),
+        ))
 marker = os.environ.get("FAKE_ADB_MARKER", "")
 serial = os.environ.get("FAKE_ADB_SERIAL", "")
 hw_serial = os.environ.get("FAKE_ADB_HW_SERIAL", "R5CT12345678")
@@ -213,9 +218,10 @@ class ReconnectTestBase(unittest.TestCase):
             environments = [line.rstrip("\n") for line in handle]
         self.assertTrue(environments)
         for entry in environments:
-            uid, _, home = entry.partition("|")
+            uid, home, android_home = entry.split("|")
             self.assertEqual(int(uid), os.geteuid())
-            self.assertEqual(home, os.environ.get("HOME", ""))
+            self.assertEqual(home, "/data")
+            self.assertEqual(android_home, "/data/.android")
         output = capture.getvalue()
         self.assertIn("adb reconnect ok", output)
         self.assertNotIn("192.168.1.50", output)
@@ -506,9 +512,10 @@ class ReconnectTestBase(unittest.TestCase):
             entries = [line.rstrip("\n") for line in handle if line.strip()]
         self.assertTrue(entries)
         for entry in entries:
-            uid, _, home = entry.partition("|")
+            uid, home, android_home = entry.split("|")
             self.assertEqual(int(uid), os.geteuid())
-            self.assertEqual(home, os.environ.get("HOME", ""))
+            self.assertEqual(home, "/data")
+            self.assertEqual(android_home, "/data/.android")
 
     # ---------- physical identity ----------
 
@@ -567,6 +574,81 @@ class ReconnectTestBase(unittest.TestCase):
         with contextlib.redirect_stderr(capture):
             self.assertTrue(bridge.startup_reconnect(server))
         self.assertIn("adb reconnect identity unverified", capture.getvalue())
+
+
+
+    # ---------- 0.3.18 adb environment and child reaping ----------
+
+    def test_19_adb_env_forces_home_even_when_parent_home_differs(self):
+        original_home = os.environ.get("HOME")
+        original_android = os.environ.get("ANDROID_USER_HOME")
+
+        def restore():
+            for key, value in (
+                ("HOME", original_home),
+                ("ANDROID_USER_HOME", original_android),
+            ):
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+        os.environ["HOME"] = "/home/app"
+        os.environ["ANDROID_USER_HOME"] = "/home/app/.android"
+        adbctl.reset_server_state()
+        adbctl.ensure_server()
+        with open(self.env_log_path, encoding="utf-8") as handle:
+            entries = [line.rstrip("\n") for line in handle if line.strip()]
+        self.assertTrue(entries)
+        for entry in entries:
+            _uid, home, android_home = entry.split("|")
+            self.assertEqual(home, "/data")
+            self.assertEqual(android_home, "/data/.android")
+        self.assertEqual(adbctl.ADB_HOME, "/data")
+        self.assertEqual(adbctl.ADB_USER_HOME, "/data/.android")
+
+    def test_20_start_server_uses_devnull_and_waits_for_the_client(self):
+        adbctl.reset_server_state()
+        proc = mock.Mock()
+        proc.wait.return_value = 0
+        with mock.patch.object(adbctl.subprocess, "Popen", return_value=proc) as popen:
+            adbctl.ensure_server()
+        kwargs = popen.call_args.kwargs
+        self.assertEqual(kwargs["stdin"], adbctl.subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], adbctl.subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], adbctl.subprocess.DEVNULL)
+        self.assertEqual(kwargs["env"]["HOME"], "/data")
+        self.assertEqual(kwargs["env"]["ANDROID_USER_HOME"], "/data/.android")
+        self.assertTrue(proc.wait.called)
+
+    def test_21_start_server_client_leaves_no_unreaped_child(self):
+        code = (
+            "import os, sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import adbctl\n"
+            "adbctl.ADB_BINARY = %r\n"
+            "adbctl.reset_server_state()\n"
+            "adbctl.ensure_server()\n"
+            "try:\n"
+            "    os.waitpid(-1, os.WNOHANG)\n"
+            "except ChildProcessError:\n"
+            "    print('clean')\n"
+            "else:\n"
+            "    print('child-remains')\n"
+        ) % (APP_DIR, self.adb)
+        env = os.environ.copy()
+        env["HOME"] = "/home/app"
+        env["FAKE_ADB_SERVER"] = "ok"
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("clean", result.stdout)
 
 
 
