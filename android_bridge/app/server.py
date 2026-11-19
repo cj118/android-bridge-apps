@@ -28,7 +28,7 @@ import control as control_actions
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.18"
+VERSION = "0.3.19"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -56,6 +56,10 @@ MCP_ALLOWED_HOSTS = (
 )
 MCP_ALLOWLIST_TTL_SECONDS = 30.0
 UI_SESSION_TTL_SECONDS = 8 * 3600
+CONTROL_SESSION_TTL_SECONDS = 15 * 60
+PROPOSAL_COOLDOWN_SECONDS = 5.0
+# First live tap test: only one pending proposal. Set False for the 3 cap.
+FIRST_TAP_TEST_MODE = True
 LOGIN_NONCE_TTL_SECONDS = 300
 # Home Assistant ingress reaches an app from the Supervisor at 172.30.32.2.
 # That single TCP peer is the only network evidence accepted for the
@@ -75,6 +79,7 @@ _FLASH_MESSAGES = {
     "reconnect_failed": (
         "Could not verify the saved tablet. Nothing was changed."
     ),
+    "screen_changed": "Screen changed — ask again.",
 }
 _INGRESS_PATH_RE = re.compile(r"\A/api/hassio_ingress/[A-Za-z0-9_-]{1,64}\Z")
 _TRACKED_HEADERS = (
@@ -588,6 +593,29 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return time.monotonic() < expires
 
+    def _control_open_locked(self):
+        """Control must be active and unexpired. Expiry cancels pending work."""
+        if not self.server.control_active:
+            return False
+        try:
+            expires = float(getattr(self.server, "control_expires", 0.0))
+        except (TypeError, ValueError):
+            expires = 0.0
+        if expires <= 0.0:
+            # Compatibility for callers/tests that set the legacy boolean.
+            return True
+        if time.monotonic() < expires:
+            return True
+        self.server.control_active = False
+        self.server.control_expires = 0.0
+        self.server.approvals.clear()
+        self.server.safety_epoch = getattr(self.server, "safety_epoch", 0) + 1
+        return False
+
+    def _control_open(self):
+        with self.server.control_lock:
+            return self._control_open_locked()
+
     def _mcp_source_ok(self):
         """Only the TCP peer address counts. Forwarding headers are ignored."""
         return mcp_source_allowed(self.client_address[0])
@@ -757,44 +785,49 @@ class Handler(BaseHTTPRequestHandler):
         "invalid_image": 502,
     }
 
-    def _capture_bytes(self):
-        """Capture once with rate limiting. Returns (png_or_None, error_code)."""
+    def _capture_frame(self):
+        """Capture once with rate limiting. Returns (png, error, device)."""
         if not self.server.capture_lock.acquire(blocking=False):
-            return None, "capture_busy"
+            return None, "capture_busy", None
         try:
             now = time.monotonic()
             times = self.server.capture_times
             while times and now - times[0] > CAPTURE_WINDOW_SECONDS:
                 times.pop(0)
             if len(times) >= CAPTURE_WINDOW_MAX:
-                return None, "rate_limited"
+                return None, "rate_limited", None
             if times and now - times[-1] < CAPTURE_MIN_INTERVAL_SECONDS:
-                return None, "rate_limited"
+                return None, "rate_limited", None
 
             info = load_device(self.server.data_dir)
             if not info:
-                return None, "device_not_paired"
+                return None, "device_not_paired", None
             _info, device = self._resolve_after_reconnect()
             if device is None:
                 self._end_sessions()
-                return None, "device_not_connected"
+                return None, "device_not_connected", None
 
             try:
                 data = adbctl.screencap(device["serial"], timeout=20.0)
                 pngcheck.validate(data, max_bytes=MAX_CAPTURE_BYTES)
             except adbctl.AdbError as exc:
                 if str(exc) == "timeout":
-                    return None, "capture_timeout"
+                    return None, "capture_timeout", None
                 if str(exc) == "output too large":
-                    return None, "image_too_large"
-                return None, "capture_failed"
+                    return None, "image_too_large", None
+                return None, "capture_failed", None
             except pngcheck.PngError:
-                return None, "invalid_image"
+                return None, "invalid_image", None
 
             times.append(now)
-            return data, None
+            return data, None, device
         finally:
             self.server.capture_lock.release()
+
+    def _capture_bytes(self):
+        """Compatibility wrapper for screenshot callers."""
+        data, error, _device = self._capture_frame()
+        return data, error
 
     def _handle_screenshot(self):
         data, error = self._capture_bytes()
@@ -840,8 +873,14 @@ class Handler(BaseHTTPRequestHandler):
                 "properties": {
                     "x": {"type": "integer", "minimum": 0, "maximum": 4095},
                     "y": {"type": "integer", "minimum": 0, "maximum": 4095},
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": "Human-readable explanation shown on the approval card.",
+                    },
                 },
-                "required": ["x", "y"],
+                "required": ["x", "y", "reason"],
                 "additionalProperties": False,
             },
         },
@@ -1026,57 +1065,115 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _mcp_propose(self, name, params, message_id):
-        if not self.server.control_active:
+        if not self._control_open():
             self._mcp_error(message_id, "control_session_inactive")
             return
         arguments = params.get("arguments") or {}
         if not isinstance(arguments, dict):
             arguments = {}
+
+        reason = None
+        if name == "android_tap":
+            try:
+                reason = control_actions.validate_reason(arguments.get("reason"))
+            except control_actions.ActionError as exc:
+                self._mcp_error(message_id, str(exc))
+                return
+
+        if not self.server.proposal_lock.acquire(blocking=False):
+            self._mcp_error(message_id, "proposal_busy")
+            return
         try:
-            if name == "android_tap":
-                action = control_actions.validate_tap(arguments.get("x"), arguments.get("y"))
-            elif name == "android_swipe":
-                action = control_actions.validate_swipe(
-                    arguments.get("x1"), arguments.get("y1"),
-                    arguments.get("x2"), arguments.get("y2"),
-                    arguments.get("duration_ms", 300),
+            now = time.monotonic()
+            if now - self.server.last_proposal_at < PROPOSAL_COOLDOWN_SECONDS:
+                self._mcp_error(message_id, "proposal_cooldown")
+                return
+            self.server.last_proposal_at = now
+            safety_epoch = getattr(self.server, "safety_epoch", 0)
+            if (
+                self.server.first_tap_test
+                and self.server.approvals.in_flight_count() >= 1
+            ):
+                self._mcp_error(message_id, "too many pending approvals")
+                return
+
+            data, error, device = self._capture_frame()
+            if error is not None:
+                self._mcp_error(message_id, error)
+                return
+            try:
+                image = pngcheck.decode(data, max_bytes=MAX_CAPTURE_BYTES)
+            except pngcheck.PngError:
+                self._mcp_error(message_id, "invalid_image")
+                return
+
+            try:
+                if name == "android_tap":
+                    action = control_actions.validate_tap(
+                        arguments.get("x"), arguments.get("y"),
+                        image.width, image.height, reason,
+                    )
+                elif name == "android_swipe":
+                    action = control_actions.validate_swipe(
+                        arguments.get("x1"), arguments.get("y1"),
+                        arguments.get("x2"), arguments.get("y2"),
+                        arguments.get("duration_ms", 300),
+                    )
+                else:
+                    action = control_actions.validate_text(arguments.get("text"))
+            except control_actions.ActionError as exc:
+                self._mcp_error(message_id, str(exc))
+                return
+
+            info = load_device(self.server.data_dir)
+            saved_serial = (info.get("serial") or "").strip()
+            try:
+                hardware_serial = adbctl.get_hardware_serial(device["serial"])
+            except adbctl.AdbError:
+                self._mcp_error(message_id, "identity_unverified")
+                return
+            if (
+                adbctl.is_hardware_serial(saved_serial)
+                and saved_serial != hardware_serial
+            ):
+                self._mcp_error(message_id, "identity_mismatch")
+                return
+
+            if (
+                not self._control_open()
+                or getattr(self.server, "safety_epoch", 0) != safety_epoch
+            ):
+                self._mcp_error(message_id, "control_session_inactive")
+                return
+
+            orientation = pngcheck.orientation(image.width, image.height)
+            try:
+                record = self.server.approvals.create(
+                    action, device["serial"], data, image.width, image.height,
+                    orientation, hardware_serial,
+                    getattr(self.server, "safety_epoch", 0),
                 )
-            else:
-                action = control_actions.validate_text(arguments.get("text"))
-        except control_actions.ActionError as exc:
-            self._mcp_error(message_id, str(exc))
-            return
-
-        _info, device = self._resolve_device()
-        if device is None:
-            self._end_sessions()
-            self._mcp_error(message_id, "device_not_connected")
-            return
-
-        try:
-            preshot = adbctl.screencap(device["serial"], timeout=20.0)
-            pngcheck.validate(preshot, max_bytes=MAX_CAPTURE_BYTES)
-        except (adbctl.AdbError, pngcheck.PngError):
-            self._mcp_error(message_id, "capture_failed")
-            return
-
-        try:
-            record = self.server.approvals.create(action, device["serial"], preshot)
-        except control_actions.ActionError as exc:
-            self._mcp_error(message_id, str(exc))
-            return
+            except control_actions.ActionError as exc:
+                self._mcp_error(message_id, str(exc))
+                return
+        finally:
+            self.server.proposal_lock.release()
 
         summary = {
             "approval_id": record["id"],
             "state": "pending",
             "action": control_actions.describe(action),
+            "reason": action.get("reason", ""),
             "device": device["serial"],
+            "width": image.width,
+            "height": image.height,
+            "orientation": orientation,
             "expires_in_seconds": int(control_actions.APPROVAL_TTL_SECONDS),
             "next": "await human approval in the Control page, then call android_action_result",
         }
         content = [
             {"type": "text", "text": json.dumps(summary)},
-            {"type": "image", "data": base64.b64encode(preshot).decode("ascii"),
+            {"type": "image", "data": base64.b64encode(data).decode("ascii"),
              "mimeType": "image/png"},
         ]
         self._send_json(
@@ -1098,6 +1195,10 @@ class Handler(BaseHTTPRequestHandler):
             "id": key,
             "state": record["state"],
             "action": control_actions.describe(record["action"]),
+            "reason": record["action"].get("reason", ""),
+            "width": record.get("width", 0),
+            "height": record.get("height", 0),
+            "orientation": record.get("orientation", ""),
             "detail": record.get("detail", ""),
         }
         content = [{"type": "text", "text": json.dumps(payload)}]
@@ -1543,8 +1644,16 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if ctl in ("on", "off"):
                 self.server.control_active = ctl == "on"
-                if ctl == "off":
+                if ctl == "on":
+                    self.server.control_expires = (
+                        time.monotonic() + CONTROL_SESSION_TTL_SECONDS
+                    )
+                else:
+                    self.server.control_expires = 0.0
                     self.server.approvals.clear()
+                    self.server.safety_epoch = (
+                        getattr(self.server, "safety_epoch", 0) + 1
+                    )
         self._respond(
             {
                 "viewing": self.server.viewing_active,
@@ -1639,9 +1748,13 @@ class Handler(BaseHTTPRequestHandler):
     def _do_stop(self):
         with self.server.control_lock:
             self.server.control_active = False
+            self.server.control_expires = 0.0
             self.server.viewing_active = False
             self.server.viewing_expires = 0.0
             self.server.approvals.clear()
+            self.server.safety_epoch = (
+                getattr(self.server, "safety_epoch", 0) + 1
+            )
         self._respond({"control": False, "pending": 0}, flash="stopped")
 
     def _end_sessions(self):
@@ -1649,18 +1762,23 @@ class Handler(BaseHTTPRequestHandler):
             self.server.viewing_active = False
             self.server.viewing_expires = 0.0
             self.server.control_active = False
+            self.server.control_expires = 0.0
             self.server.approvals.clear()
+            self.server.safety_epoch = (
+                getattr(self.server, "safety_epoch", 0) + 1
+            )
 
     def _do_approve(self, fields):
         key = (fields.get("id") or "").strip()
         with self.server.control_lock:
-            if not self.server.control_active:
+            if not self._control_open_locked():
                 self._respond({"error": "control_inactive"}, 409, flash="error")
                 return
-            try:
-                record = self.server.approvals.approve(key)
-            except control_actions.ActionError as exc:
-                self._respond({"error": str(exc)}, 409, flash="error")
+            record = self.server.approvals.get(key)
+            if record is None or record["state"] != "pending":
+                self._respond(
+                    {"error": "approval is not pending"}, 409, flash="error"
+                )
                 return
             if record["expires"] <= time.monotonic():
                 self.server.approvals.fail(key, "expired")
@@ -1675,6 +1793,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.approvals.fail(key, "binding_mismatch")
                 self._respond({"error": "binding mismatch"}, 409, flash="error")
                 return
+            if record.get("safety_epoch", 0) != getattr(
+                self.server, "safety_epoch", 0
+            ):
+                self.server.approvals.fail(key, "cancelled")
+                self._respond({"error": "approval cancelled"}, 409, flash="error")
+                return
+
             _info, device = self._resolve_device()
             if device is None:
                 self.server.approvals.fail(key, "device_unavailable")
@@ -1684,6 +1809,97 @@ class Handler(BaseHTTPRequestHandler):
             if device["serial"] != record["device"]:
                 self.server.approvals.fail(key, "device_mismatch")
                 self._respond({"error": "device mismatch"}, 409, flash="error")
+                return
+
+            if record["action"].get("type") == "tap":
+                info = load_device(self.server.data_dir)
+                saved_serial = (info.get("serial") or "").strip()
+                try:
+                    hardware_serial = adbctl.get_hardware_serial(
+                        device["serial"]
+                    )
+                except adbctl.AdbError:
+                    self.server.approvals.fail(key, "identity_mismatch")
+                    self._respond(
+                        {"error": "identity_mismatch"}, 409, flash="error"
+                    )
+                    return
+                if (
+                    not adbctl.is_hardware_serial(hardware_serial)
+                    or hardware_serial != record.get("hardware_serial")
+                    or (
+                        adbctl.is_hardware_serial(saved_serial)
+                        and saved_serial != hardware_serial
+                    )
+                ):
+                    self.server.approvals.fail(key, "identity_mismatch")
+                    self._respond(
+                        {"error": "identity_mismatch"}, 409, flash="error"
+                    )
+                    return
+
+                try:
+                    fresh = adbctl.screencap(device["serial"], timeout=20.0)
+                    pngcheck.validate(fresh, max_bytes=MAX_CAPTURE_BYTES)
+                except (adbctl.AdbError, pngcheck.PngError):
+                    self.server.approvals.fail(key, "screen_changed")
+                    self._respond(
+                        {"error": "screen_changed"}, 409,
+                        flash="screen_changed",
+                    )
+                    return
+                try:
+                    before = pngcheck.decode(
+                        record["preshot"], max_bytes=MAX_CAPTURE_BYTES
+                    )
+                    after = pngcheck.decode(
+                        fresh, max_bytes=MAX_CAPTURE_BYTES
+                    )
+                except pngcheck.PngError:
+                    self.server.approvals.fail(key, "screen_changed")
+                    self._respond(
+                        {"error": "screen_changed"}, 409,
+                        flash="screen_changed",
+                    )
+                    return
+                original_orientation = pngcheck.orientation(
+                    before.width, before.height
+                )
+                current_orientation = pngcheck.orientation(
+                    after.width, after.height
+                )
+                x = int(record["action"].get("x", -1))
+                y = int(record["action"].get("y", -1))
+                if (
+                    before.width != after.width
+                    or before.height != after.height
+                    or original_orientation != current_orientation
+                    or pngcheck.region_changed(before, after, x, y)
+                ):
+                    self.server.approvals.fail(key, "screen_changed")
+                    self._respond(
+                        {"error": "screen_changed"}, 409,
+                        flash="screen_changed",
+                    )
+                    return
+
+            try:
+                record = self.server.approvals.approve(key)
+            except control_actions.ActionError as exc:
+                self._respond({"error": str(exc)}, 409, flash="error")
+                return
+
+            # Last check immediately before any ADB input. STOP and Control
+            # expiry cannot interleave while this lock is held.
+            if (
+                not self._control_open_locked()
+                or record.get("safety_epoch", 0)
+                != getattr(self.server, "safety_epoch", 0)
+            ):
+                self.server.approvals.fail(key, "cancelled")
+                self._respond(
+                    {"error": "control_inactive"}, 409, flash="error"
+                )
                 return
             try:
                 adbctl.run_input(
@@ -1701,7 +1917,8 @@ class Handler(BaseHTTPRequestHandler):
         except (adbctl.AdbError, pngcheck.PngError):
             self.server.approvals.complete(key, None, "executed_no_shot")
             self._respond(
-                {"status": "executed", "screenshot": "unavailable"}, flash="executed"
+                {"status": "executed", "screenshot": "unavailable"},
+                flash="executed",
             )
             return
         self.server.approvals.complete(key, shot)
@@ -1716,6 +1933,84 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._respond({"status": "rejected"}, flash="rejected")
 
+    def _crosshair_html(self, x, y, width, height):
+        if width <= 0 or height <= 0:
+            return ""
+        left = x * 100.0 / width
+        top = y * 100.0 / height
+        common = (
+            "position:absolute;left:%.4f%%;top:%.4f%%;"
+            "transform:translate(-50%%,-50%%);background:#ffd400;"
+            "box-shadow:0 0 0 2px #111;pointer-events:none"
+        ) % (left, top)
+        return (
+            "<span class='tap-crosshair' style='%s;width:32px;height:2px'></span>"
+            "<span class='tap-crosshair' style='%s;width:2px;height:32px'></span>"
+            % (common, common)
+        )
+
+    def _result_label(self, record):
+        state = record["state"]
+        detail = record.get("detail", "")
+        if state == "executed":
+            if record.get("postshot"):
+                return "Executed"
+            return "Executed — post-action screenshot unavailable"
+        if state == "rejected":
+            return "Rejected"
+        if state == "expired":
+            return "Expired"
+        if state == "cancelled":
+            return "Cancelled"
+        if state == "failed":
+            if detail == "screen_changed":
+                return "Failed — Screen changed — ask again."
+            if detail == "identity_mismatch":
+                return "Failed — Device identity changed."
+            return "Failed"
+        return state.replace("_", " ").title()
+
+    def _result_cards(self):
+        results = self.server.approvals.recent(5)
+        cards = []
+        for record in results:
+            action = record["action"]
+            reason = html.escape(str(action.get("reason", "")), quote=True)
+            label = html.escape(self._result_label(record), quote=True)
+            description = html.escape(
+                control_actions.describe(action), quote=True
+            )
+            device = html.escape(str(record["device"]), quote=True)
+            detail = html.escape(str(record.get("detail", "")), quote=True)
+            image = ""
+            if record.get("postshot"):
+                encoded = base64.b64encode(record["postshot"]).decode("ascii")
+                image = (
+                    "<img src='data:image/png;base64,%s' "
+                    "style='display:block;max-width:100%%;height:auto;"
+                    "margin-top:.5rem'>" % encoded
+                )
+            detail_html = (
+                "<p><b>Detail:</b> %s</p>" % detail if detail else ""
+            )
+            cards.append(
+                "<div style='border:1px solid #444;padding:.75rem;"
+                "margin:.75rem 0'>"
+                "<h3>%s — %s</h3>"
+                "<p>Device: %s &middot; id %s</p>"
+                "<p><b>AI reason:</b> %s</p>%s%s</div>"
+                % (
+                    label,
+                    description,
+                    device,
+                    html.escape(record["id"], quote=True),
+                    reason,
+                    detail_html,
+                    image,
+                )
+            )
+        return "".join(cards) or "<p>None.</p>"
+
     def _control_page(self, nonce, flash=""):
         session = self.server.ui_sessions.get(nonce) or {}
         csrf = session.get("csrf", "")
@@ -1727,37 +2022,83 @@ class Handler(BaseHTTPRequestHandler):
             if message
             else ""
         )
+        now = time.monotonic()
+        control_open = self._control_open()
         pending = self.server.approvals.pending()
         cards = []
         for record in pending:
             image = base64.b64encode(record["preshot"]).decode("ascii")
-            remaining = max(0, int(record["expires"] - time.monotonic()))
+            action = record["action"]
+            reason = html.escape(str(action.get("reason", "")), quote=True)
+            device = html.escape(str(record["device"]), quote=True)
+            description = html.escape(
+                control_actions.describe(action), quote=True
+            )
+            width = int(record.get("width", 0))
+            height = int(record.get("height", 0))
+            orientation = html.escape(
+                str(record.get("orientation", "")), quote=True
+            )
+            remaining = max(0, int(record["expires"] - now))
+            tap_line = ""
+            overlay = ""
+            if action.get("type") == "tap":
+                x = int(action.get("x", 0))
+                y = int(action.get("y", 0))
+                tap_line = (
+                    "<p><b>Proposed action:</b> TAP &middot; "
+                    "X=%d, Y=%d</p>" % (x, y)
+                )
+                overlay = self._crosshair_html(x, y, width, height)
             cards.append(
-                "<div style='border:1px solid #555;padding:1rem;margin:1rem 0'>"
-                "<h3>%s</h3><p>Device %s &middot; id %s &middot; expires in %ds</p>"
-                "<img src='data:image/png;base64,%s' style='max-width:100%%'>"
-                "<form method='post' action='control/approve' style='display:inline'>"
+                "<div style='border:1px solid #555;padding:1rem;"
+                "margin:1rem 0'>"
+                "<h3>%s</h3>%s"
+                "<p><b>AI reason:</b> %s</p>"
+                "<p><b>Screen:</b> %d × %d — %s</p>"
+                "<p>Device: %s &middot; id %s &middot; expires in %ds</p>"
+                "<div style='position:relative;display:inline-block;"
+                "max-width:100%%;line-height:0'>"
+                "<img src='data:image/png;base64,%s' "
+                "style='display:block;max-width:100%%;height:auto;width:auto'>"
+                "%s</div>"
+                "<form method='post' action='control/approve' "
+                "style='display:inline'>"
                 "<input type='hidden' name='csrf' value='%s'>"
-                "<input type='hidden' name='id' value='%s'><button>Approve</button></form> "
-                "<form method='post' action='control/reject' style='display:inline'>"
+                "<input type='hidden' name='id' value='%s'>"
+                "<button>Approve</button></form> "
+                "<form method='post' action='control/reject' "
+                "style='display:inline'>"
                 "<input type='hidden' name='csrf' value='%s'>"
-                "<input type='hidden' name='id' value='%s'><button>Reject</button></form>"
+                "<input type='hidden' name='id' value='%s'>"
+                "<button>Reject</button></form>"
                 "</div>"
                 % (
-                    control_actions.describe(record["action"]),
-                    record["device"],
-                    record["id"],
+                    description,
+                    tap_line,
+                    reason,
+                    width,
+                    height,
+                    orientation,
+                    device,
+                    html.escape(record["id"], quote=True),
                     remaining,
                     image,
+                    overlay,
                     csrf_attr,
-                    record["id"],
+                    html.escape(record["id"], quote=True),
                     csrf_attr,
-                    record["id"],
+                    html.escape(record["id"], quote=True),
                 )
             )
         viewing_open = self._viewing_open()
         viewing = "ON" if viewing_open else "off"
-        control = "ON" if self.server.control_active else "off"
+        control = "ON" if control_open else "off"
+        if control_open:
+            expires = float(getattr(self.server, "control_expires", 0.0))
+            if expires > 0:
+                left = max(0, int(expires - now))
+                control = "ON (%dm %02ds)" % (left // 60, left % 60)
         saved = load_device(self.server.data_dir)
         if saved:
             saved_form = (
@@ -1785,6 +2126,7 @@ class Handler(BaseHTTPRequestHandler):
             "<input type='hidden' name='csrf' value='%s'>"
             "<button style='background:#a00;color:#fff;padding:.6rem 2rem'>STOP</button>"
             "</form>"
+            "<p style='color:#f88'>STOP cannot undo a tap that has already been sent.</p>"
             "<h2>Device</h2>"
             "<form method='post' action='pair'>"
             "<input type='hidden' name='csrf' value='%s'>"
@@ -1797,7 +2139,8 @@ class Handler(BaseHTTPRequestHandler):
             "<form method='post' action='disconnect' style='margin-top:.5rem'>"
             "<input type='hidden' name='csrf' value='%s'>"
             "<button>Disconnect</button></form>"
-            "<h2>Pending approvals</h2>%s</body></html>"
+            "<h2>Pending approvals</h2>%s"
+            "<h2>Recent results</h2>%s</body></html>"
             % (
                 flash_html,
                 viewing,
@@ -1805,13 +2148,14 @@ class Handler(BaseHTTPRequestHandler):
                 csrf_attr,
                 "off" if viewing_open else "on",
                 "ON" if viewing_open else "start",
-                "off" if self.server.control_active else "on",
-                "ON" if self.server.control_active else "start",
+                "off" if control_open else "on",
+                "ON" if control_open else "start",
                 csrf_attr,
                 csrf_attr,
                 saved_form,
                 csrf_attr,
                 "".join(cards) or "<p>None.</p>",
+                self._result_cards(),
             )
         )
         return body.encode("utf-8")
@@ -2001,11 +2345,16 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.viewing_active = False
     server.viewing_expires = 0.0
     server.control_active = False
+    server.control_expires = 0.0
+    server.safety_epoch = 0
+    server.proposal_lock = threading.Lock()
+    server.last_proposal_at = 0.0
     server.ui_sessions = {}
     server.login_nonces = {}
     server.allowed_users = load_allowed_users(data_dir)
     server.exposed_tools = load_exposed_tools(data_dir)
-    server.control_lock = threading.Lock()
+    server.control_lock = threading.RLock()
+    server.first_tap_test = FIRST_TAP_TEST_MODE
     server.approvals = control_actions.Approvals()
     server.reconnector = reconnect_module.Reconnector()
     server.started_monotonic = time.monotonic()

@@ -17,6 +17,7 @@ MAX_COORD = 4095
 MAX_SWIPE_MS = 5000
 MIN_SWIPE_MS = 50
 MAX_TEXT_LEN = 200
+MAX_REASON_LEN = 200
 APPROVAL_TTL_SECONDS = 120.0
 MAX_PENDING = 3
 _TEXT_RE = re.compile(r"\A[A-Za-z0-9 .,!?@#_+:\-]{1,%d}\Z" % MAX_TEXT_LEN)
@@ -26,18 +27,38 @@ class ActionError(ValueError):
     """The requested action is malformed or not permitted."""
 
 
-def _coord(value):
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        raise ActionError("invalid coordinate") from None
-    if not 0 <= number <= MAX_COORD:
+def _coord(value, limit=MAX_COORD):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ActionError("invalid coordinate")
+    if not 0 <= value < limit:
         raise ActionError("coordinate out of range")
-    return number
+    return value
 
 
-def validate_tap(x, y):
-    return {"type": "tap", "x": _coord(x), "y": _coord(y)}
+def validate_reason(reason):
+    """Accept a non-empty human-readable explanation, at most 200 chars."""
+    if not isinstance(reason, str):
+        raise ActionError("reason is required")
+    if not reason.strip():
+        raise ActionError("reason is required")
+    if len(reason) > MAX_REASON_LEN:
+        raise ActionError("reason is too long")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in reason):
+        raise ActionError("reason contains unsupported characters")
+    return reason
+
+
+def validate_tap(x, y, width, height, reason):
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+        raise ActionError("invalid screen width")
+    if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
+        raise ActionError("invalid screen height")
+    return {
+        "type": "tap",
+        "x": _coord(x, width),
+        "y": _coord(y, height),
+        "reason": validate_reason(reason),
+    }
 
 
 def validate_swipe(x1, y1, x2, y2, duration_ms=300):
@@ -115,13 +136,15 @@ class Approvals:
         self.max_pending = max_pending
         self.records = {}
         self.order = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def _sweep(self):
         now = time.monotonic()
         for record in self.records.values():
             if record["state"] in ("pending", "approved") and record["expires"] <= now:
                 record["state"] = "expired"
+                if record.get("finished") is None:
+                    record["finished"] = now
         while len(self.order) > 20:
             oldest = self.order.pop(0)
             record = self.records.get(oldest)
@@ -129,14 +152,31 @@ class Approvals:
                 self.records.pop(oldest, None)
 
     def pending_count(self):
-        self._sweep()
-        return sum(1 for r in self.records.values() if r["state"] == "pending")
-
-    def create(self, action, device, preshot):
         with self._lock:
-            return self._create(action, device, preshot)
+            self._sweep()
+            return sum(
+                1 for r in self.records.values() if r["state"] == "pending"
+            )
 
-    def _create(self, action, device, preshot):
+    def in_flight_count(self):
+        """Pending plus approved-but-not-yet-completed records."""
+        with self._lock:
+            self._sweep()
+            return sum(
+                1 for r in self.records.values()
+                if r["state"] in ("pending", "approved")
+            )
+
+    def create(self, action, device, preshot, width, height, orientation,
+               hardware_serial, safety_epoch=0):
+        with self._lock:
+            return self._create(
+                action, device, preshot, width, height, orientation,
+                hardware_serial, safety_epoch,
+            )
+
+    def _create(self, action, device, preshot, width, height, orientation,
+                hardware_serial, safety_epoch):
         self._sweep()
         if self.pending_count() >= self.max_pending:
             raise ActionError("too many pending approvals")
@@ -147,14 +187,21 @@ class Approvals:
             "device": device,
             "preshot": preshot,
             "postshot": None,
+            "width": width,
+            "height": height,
+            "orientation": orientation,
+            "hardware_serial": hardware_serial,
+            "safety_epoch": safety_epoch,
             "fingerprint": fingerprint(action, device, preshot),
             "created": time.monotonic(),
             "expires": time.monotonic() + self.ttl,
             "state": "pending",
             "detail": "",
+            "finished": None,
         }
         self.records[key] = record
         self.order.append(key)
+        self._sweep()
         return record
 
     def get(self, key):
@@ -166,8 +213,11 @@ class Approvals:
         return self.records.get(key)
 
     def pending(self):
-        self._sweep()
-        return [r for r in self.records.values() if r["state"] == "pending"]
+        with self._lock:
+            self._sweep()
+            return [
+                r for r in self.records.values() if r["state"] == "pending"
+            ]
 
     def approve(self, key):
         with self._lock:
@@ -187,14 +237,21 @@ class Approvals:
         return record
 
     def complete(self, key, postshot, detail=""):
-        record = self.records.get(key)
-        if record is not None:
-            record.update(state="executed", postshot=postshot, detail=detail)
+        with self._lock:
+            record = self.records.get(key)
+            if record is not None:
+                record.update(
+                    state="executed", postshot=postshot, detail=detail,
+                    finished=time.monotonic(),
+                )
 
     def fail(self, key, detail):
-        record = self.records.get(key)
-        if record is not None:
-            record.update(state="failed", detail=detail)
+        with self._lock:
+            record = self.records.get(key)
+            if record is not None:
+                record.update(
+                    state="failed", detail=detail, finished=time.monotonic()
+                )
 
     def reject(self, key):
         with self._lock:
@@ -207,12 +264,32 @@ class Approvals:
         if record["state"] != "pending":
             raise ActionError("approval is not pending")
         record["state"] = "rejected"
+        record["finished"] = time.monotonic()
         return record
 
-    def clear(self):
+    def recent(self, limit=5):
+        """Completed results, newest first, bounded by the order list."""
         with self._lock:
-            for record in self.records.values():
+            self._sweep()
+            rows = [
+                record for record in self.records.values()
+                if record["state"] not in ("pending", "approved")
+            ]
+            rows.sort(key=lambda record: record["created"], reverse=True)
+            return rows[:max(1, int(limit))]
+
+    def clear(self):
+        """Cancel pending/approved work and keep bounded completed history."""
+        with self._lock:
+            for key in list(self.records):
+                record = self.records[key]
                 if record["state"] in ("pending", "approved"):
                     record["state"] = "cancelled"
-            self.records.clear()
-            self.order.clear()
+                    record["finished"] = time.monotonic()
+                    self.records.pop(key, None)
+            self.order = [key for key in self.order if key in self.records]
+            while len(self.order) > 20:
+                oldest = self.order.pop(0)
+                record = self.records.get(oldest)
+                if record is not None and record["state"] not in ("pending", "approved"):
+                    self.records.pop(oldest, None)

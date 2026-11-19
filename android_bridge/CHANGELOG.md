@@ -1,5 +1,43 @@
 # Android Bridge changelog
 
+## 0.3.19
+
+- `android_tap` now requires a non-empty human-readable `reason` of at most
+  200 characters. The reason, device string and every other displayed value
+  are HTML-escaped on the approval card.
+- Approval cards show TAP, X/Y, the AI reason, actual screenshot width/height
+  and orientation, time remaining, the pre-action screenshot and Approve /
+  Reject buttons. A CSS crosshair is positioned from x/width and y/height, so
+  it stays aligned when the image is resized; the image is never cropped or
+  distorted.
+- Tap coordinates are strict integers in `0..width-1` and `0..height-1`, using
+  the decoded screenshot dimensions rather than the old 0–4095 range.
+- Approval captures a fresh screenshot and compares the decoded pixels in a
+  48 px radius around the tap against the proposal image. Rotation, dimension
+  changes, invalid captures or material target-area changes fail closed with
+  “Screen changed — ask again.” Tolerances are documented in `pngcheck.py`
+  (per-channel delta > 24; more than 0.5% of region pixels changed).
+- Each proposal stores the verified hardware serial, ADB transport, screen
+  dimensions/orientation, coordinates, reason, fingerprint, expiry and a
+  safety epoch. Approval rechecks the connected device, transport and hardware
+  serial, and never substitutes another tablet.
+- Control sessions expire after 15 minutes; expiry blocks proposals and
+  approvals and clears pending proposals. Viewing remains independent. The
+  panel shows Control ON with remaining time.
+- STOP cancels pending work and increments a safety epoch. Approval rechecks
+  Control/STOP immediately before ADB input. The panel documents that STOP
+  cannot undo a tap already sent.
+- Proposal screenshots use the existing capture rate limiter, with a five
+  second proposal cooldown and the existing three-pending cap. The first live
+  test mode allows only one pending proposal; the class retains the three
+  pending capability.
+- The Control panel now shows bounded completed results, including executed,
+  rejected, expired and failed states, and the post-action screenshot when
+  available. Execution success is reported separately from screenshot success.
+- Default exposure remains exactly `android_screenshot` and `android_status`.
+  Swipe and text implementations are unchanged. Viewing, Control, CSRF,
+  Origin, HA-user, replay and bearer restrictions are unchanged.
+
 ## 0.3.18
 
 - Run every adb subprocess with an explicit `HOME=/data` and

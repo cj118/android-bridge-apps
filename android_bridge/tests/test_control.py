@@ -1,6 +1,7 @@
 """Approval security: UI session, CSRF, binding, replay, expiry, STOP."""
 
 import base64
+import binascii
 import contextlib
 import io
 import json
@@ -13,6 +14,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+import zlib
 from html.parser import HTMLParser
 from http.client import HTTPConnection
 
@@ -22,9 +24,10 @@ sys.path.insert(0, APP_DIR)
 
 import server as bridge  # noqa: E402
 import adbctl  # noqa: E402
+import control as control_actions  # noqa: E402
 
 FAKE_ADB = r'''#!/usr/bin/env python3
-import os, sys
+import os, sys, time
 args = sys.argv[1:]
 log = os.environ.get("FAKE_ADB_LOG")
 if log:
@@ -69,6 +72,27 @@ if "-s" in args and "getprop" in args:
         print(os.environ.get("FAKE_ADB_MODEL", "SM_X210"))
     sys.exit(0)
 if "-s" in args and "exec-out" in args:
+    sleep = float(os.environ.get("FAKE_ADB_SCREENCAP_SLEEP", "0") or "0")
+    if sleep:
+        time.sleep(sleep)
+    mode = os.environ.get("FAKE_ADB_SCREENCAP_MODE", "ok")
+    counter_path = os.environ.get("FAKE_ADB_SCREENCAP_COUNTER")
+    count = 0
+    if counter_path:
+        try:
+            with open(counter_path) as fh:
+                count = int(fh.read().strip() or "0")
+        except (OSError, ValueError):
+            count = 0
+        count += 1
+        with open(counter_path, "w") as fh:
+            fh.write(str(count))
+    fail_after = int(os.environ.get("FAKE_ADB_SCREENCAP_FAIL_AFTER", "0") or "0")
+    if mode == "fail" or (fail_after and count > fail_after):
+        sys.exit(1)
+    if mode == "garbage":
+        sys.stdout.buffer.write(b"not-a-png")
+        sys.exit(0)
     with open(os.environ["FAKE_ADB_PNG"], "rb") as fh:
         sys.stdout.buffer.write(fh.read())
     sys.exit(0)
@@ -78,9 +102,35 @@ sys.exit(7)
 '''
 
 
-def make_png(w=1920, h=1200):
-    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR"
-            + struct.pack(">II", w, h) + b"\x00" * 9)
+def _png_chunk(kind, payload):
+    return (
+        struct.pack(">I", len(payload))
+        + kind
+        + payload
+        + struct.pack(">I", binascii.crc32(kind + payload) & 0xFFFFFFFF)
+    )
+
+
+def make_png(w=1920, h=1200, blocks=()):
+    """A valid deterministic RGBA PNG, with optional solid rectangles."""
+    base = bytes((245, 245, 245, 255)) * w
+    raw = bytearray()
+    for y in range(h):
+        line = bytearray(base)
+        for x1, y1, x2, y2, red, green, blue, alpha in blocks:
+            if y1 <= y < y2:
+                line[max(0, x1) * 4:min(w, x2) * 4] = bytes(
+                    (red, green, blue, alpha)
+                ) * max(0, min(w, x2) - max(0, x1))
+        raw.append(0)
+        raw.extend(line)
+    header = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 class RenderedPage(HTMLParser):
@@ -133,6 +183,7 @@ class ControlSecurityTests(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp(prefix="bridge-ctl-")
         cls.png = make_png()
         cls.png_path = os.path.join(cls.tmp, "frame.png")
+        cls.screen_counter = os.path.join(cls.tmp, "screen-count")
         with open(cls.png_path, "wb") as fh:
             fh.write(cls.png)
         adb = os.path.join(cls.tmp, "adb")
@@ -183,7 +234,16 @@ class ControlSecurityTests(unittest.TestCase):
         os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT12345678"
         os.environ["FAKE_ADB_MODEL"] = "SM_X210"
         os.environ["FAKE_ADB_SERVER"] = "ok"
+        os.environ["FAKE_ADB_SCREENCAP_MODE"] = "ok"
+        os.environ["FAKE_ADB_SCREENCAP_FAIL_AFTER"] = "0"
+        os.environ["FAKE_ADB_SCREENCAP_SLEEP"] = "0"
+        os.environ["FAKE_ADB_SCREENCAP_COUNTER"] = self.screen_counter
         adbctl.reset_server_state()
+        with open(self.png_path, "wb") as handle:
+            handle.write(self.png)
+        with open(self.screen_counter, "w") as handle:
+            handle.write("0")
+        self.server.last_proposal_at = 0.0
         bridge.save_device(self.data_dir, "192.168.1.50", "41234")
         open(self.log_path, "w").close()
 
@@ -280,9 +340,19 @@ class ControlSecurityTests(unittest.TestCase):
                                     "arguments": {"id": key}}})
 
     def new_proposal(self):
-        _, payload = self.propose("android_tap", {"x": 540, "y": 780})
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap",
+            {"x": 540, "y": 780, "reason": "test harmlessly"},
+        )
         text = payload["result"]["content"][0]["text"]
         return json.loads(text)["approval_id"]
+
+    def set_screen(self, data):
+        with open(self.png_path, "wb") as handle:
+            handle.write(data)
+        self.server.capture_times.clear()
 
     def adb_log(self):
         with open(self.log_path) as fh:
@@ -296,13 +366,17 @@ class ControlSecurityTests(unittest.TestCase):
     def test_proposal_requires_control_session(self):
         self.server.viewing_active = True
         self.server.viewing_expires = time.monotonic() + 3600
-        _, payload = self.propose("android_tap", {"x": 10, "y": 20})
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "test"}
+        )
         self.assertTrue(payload["result"]["isError"])
         self.assertEqual(payload["result"]["content"][0]["text"], "control_session_inactive")
 
     def test_proposal_returns_pending_with_preshot(self):
         self.start_control()
-        _, payload = self.propose("android_tap", {"x": 540, "y": 780})
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "test click"}
+        )
         summary = json.loads(payload["result"]["content"][0]["text"])
         self.assertEqual(summary["state"], "pending")
         self.assertIn("Tap (540, 780)", summary["action"])
@@ -593,7 +667,8 @@ class ControlSecurityTests(unittest.TestCase):
             {"Content-Type": "application/json"},
             json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                         "params": {"name": "android_tap",
-                                   "arguments": {"x": 13, "y": 14}}}).encode(),
+                                   "arguments": {"x": 13, "y": 14,
+                                                 "reason": "blocked"}}}).encode(),
         )
         self.assertEqual(status, 403)
         self.assertNotIn(b"result", payload)
@@ -608,7 +683,9 @@ class ControlSecurityTests(unittest.TestCase):
         self.ctl("/control/session", {"view": "on", "control": "off"}, cookie, csrf)
         status, _, _ = self.req("GET", "/screenshot", self.bearer())
         self.assertEqual(status, 200)
-        _, payload = self.propose("android_tap", {"x": 1, "y": 1})
+        _, payload = self.propose(
+            "android_tap", {"x": 1, "y": 1, "reason": "test"}
+        )
         self.assertEqual(payload["result"]["content"][0]["text"], "control_session_inactive")
 
     def test_disconnect_ends_sessions(self):
@@ -1586,6 +1663,488 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertNotIn("connection_refused", output)
         with open(path, "rb") as handle:
             self.assertEqual(handle.read(), before)
+
+
+    # ---------- 0.3.19 safe tap ----------
+
+    def test_tap_reason_is_required_and_bounded(self):
+        cookie, _csrf = self.start_control()
+        for arguments in (
+            {"x": 10, "y": 20},
+            {"x": 10, "y": 20, "reason": ""},
+            {"x": 10, "y": 20, "reason": "   "},
+        ):
+            with self.subTest(arguments=arguments):
+                self.server.last_proposal_at = 0.0
+                self.server.capture_times.clear()
+                _, payload = self.propose("android_tap", arguments)
+                self.assertTrue(payload["result"]["isError"])
+                self.assertIn(
+                    "reason is required",
+                    payload["result"]["content"][0]["text"],
+                )
+        with self.assertRaises(control_actions.ActionError):
+            control_actions.validate_reason("x" * 201)
+        self.assertEqual(len(control_actions.validate_reason("x" * 200)), 200)
+
+    def test_tap_reason_is_html_escaped(self):
+        cookie, _csrf = self.start_control()
+        reason = '<script>alert(1)</script> & "quoted"'
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": reason}
+        )
+        self.assertFalse(payload["result"]["isError"])
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn(
+            "&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quoted&quot;",
+            text,
+        )
+        self.assertNotIn("<script>alert(1)</script>", text)
+
+    def test_device_is_html_escaped_on_card(self):
+        cookie, _csrf = self.login()
+        self.server.approvals.clear()
+        action = control_actions.validate_tap(10, 10, 100, 100, "safe test")
+        self.server.approvals.create(
+            action, '<img src=x onerror=alert(1)>', self.png,
+            100, 100, "Landscape", "R5CT12345678",
+        )
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"<img src=x", page)
+        self.assertIn(b"&lt;img src=x", page)
+
+    def test_crosshair_uses_percentages_and_original_coordinates(self):
+        cookie, _csrf = self.start_control()
+        self.new_proposal()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn("left:28.1250%;top:65.0000%", text)
+        self.assertIn("X=540, Y=780", text)
+        self.assertIn("max-width:100%;height:auto", text)
+        self.assertIn("1920 × 1200 — Landscape", text)
+
+    def test_portrait_screen_is_reported(self):
+        cookie, _csrf = self.start_control()
+        self.set_screen(make_png(1200, 1920))
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap",
+            {"x": 600, "y": 900, "reason": "portrait check"},
+        )
+        self.assertFalse(payload["result"]["isError"])
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("1200 × 1920 — Portrait", page.decode("utf-8"))
+
+    def test_out_of_bounds_and_non_integer_taps_are_rejected(self):
+        self.start_control()
+        cases = (
+            (1920, 10), (-1, 10), (10, 1200), (10, -1),
+            (1.5, 10), ("10", 10), (True, 10), (10, False),
+        )
+        for x, y in cases:
+            with self.subTest(x=x, y=y):
+                self.server.last_proposal_at = 0.0
+                self.server.capture_times.clear()
+                _, payload = self.propose(
+                    "android_tap", {"x": x, "y": y, "reason": "bounds"}
+                )
+                self.assertTrue(payload["result"]["isError"])
+                self.assertIn(
+                    payload["result"]["content"][0]["text"],
+                    ("coordinate out of range", "invalid coordinate"),
+                )
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_changed_target_area_refuses_execution(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.set_screen(
+            make_png(1920, 1200, blocks=[(500, 740, 580, 820, 0, 0, 0, 255)])
+        )
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=screen_changed", headers["Location"])
+        self.assertNotIn("'input'", self.adb_log())
+        record = self.server.approvals.get(key)
+        self.assertEqual(record["state"], "failed")
+        self.assertEqual(record["detail"], "screen_changed")
+        _, page, _ = self.req("GET", "/control", cookie)
+        self.assertIn("Screen changed — ask again.", page.decode("utf-8"))
+
+    def test_rotated_screen_refuses_execution(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.set_screen(make_png(1200, 1920))
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=screen_changed", headers["Location"])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_fresh_screenshot_failure_refuses_execution(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        os.environ["FAKE_ADB_SCREENCAP_FAIL_AFTER"] = "1"
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=screen_changed", headers["Location"])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_invalid_fresh_screenshot_refuses_execution(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        os.environ["FAKE_ADB_SCREENCAP_MODE"] = "garbage"
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=screen_changed", headers["Location"])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_invalid_proposal_screenshot_is_refused(self):
+        self.start_control()
+        os.environ["FAKE_ADB_SCREENCAP_MODE"] = "garbage"
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "bad shot"}
+        )
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_hardware_identity_mismatch_at_approval_is_refused(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT00000000"
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=error", headers["Location"])
+        self.assertNotIn("'input'", self.adb_log())
+        self.assertEqual(
+            self.server.approvals.get(key)["detail"], "identity_mismatch"
+        )
+
+    def test_saved_hardware_identity_mismatch_at_proposal_is_refused(self):
+        self.start_control()
+        bridge.save_device(
+            self.data_dir, "192.168.1.50", "41234",
+            {"serial": "R5CT00000000", "model": "SM_X210"},
+        )
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "identity"}
+        )
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "identity_mismatch"
+        )
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_missing_hardware_identity_at_approval_is_refused(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        os.environ["FAKE_ADB_HW_SERIAL"] = ""
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'input'", self.adb_log())
+        self.assertEqual(
+            self.server.approvals.get(key)["detail"], "identity_mismatch"
+        )
+
+    def test_control_expiry_blocks_proposals_and_clears_pending(self):
+        cookie, _csrf = self.start_control()
+        key = self.new_proposal()
+        self.server.control_expires = time.monotonic() - 1
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "expired"}
+        )
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "control_session_inactive"
+        )
+        self.assertIsNone(self.server.approvals.get(key))
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("Control session: <b>off</b>", page.decode("utf-8"))
+
+    def test_control_expiry_during_approval_refuses_execution(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.server.control_expires = time.monotonic() - 1
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_control_panel_shows_remaining_time(self):
+        cookie, _csrf = self.start_control()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("Control session: <b>ON (", page.decode("utf-8"))
+
+    def test_control_off_cancels_pending(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.ctl(
+            "/control/session", {"control": "off"}, cookie, csrf
+        )
+        self.assertEqual(status, 303)
+        self.assertIsNone(self.server.approvals.get(key))
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_concurrent_approvals_execute_once(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+
+        def worker():
+            self.ctl("/control/approve", {"id": key}, cookie, csrf)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertEqual(self.adb_log().count("'input'"), 1)
+
+    def test_proposal_cooldown(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.server.last_proposal_at = time.monotonic()
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "too soon"}
+        )
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "proposal_cooldown"
+        )
+        self.ctl("/control/reject", {"id": key}, cookie, csrf)
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "allowed"}
+        )
+        self.assertFalse(payload["result"]["isError"])
+
+    def test_first_test_mode_allows_one_pending(self):
+        self.start_control()
+        self.assertEqual(self.server.approvals.max_pending, 3)
+        self.assertTrue(self.server.first_tap_test)
+        self.new_proposal()
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "second"}
+        )
+        self.assertEqual(
+            payload["result"]["content"][0]["text"],
+            "too many pending approvals",
+        )
+
+    def test_approvals_class_keeps_three_pending_capability(self):
+        approvals = control_actions.Approvals(max_pending=3)
+        action = control_actions.validate_tap(1, 1, 100, 100, "test")
+        for _ in range(3):
+            approvals.create(
+                action, "transport", b"shot", 100, 100, "Square", "hardware"
+            )
+        with self.assertRaises(control_actions.ActionError):
+            approvals.create(
+                action, "transport", b"shot", 100, 100, "Square", "hardware"
+            )
+
+    def test_postshot_failure_reports_executed_without_screenshot(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        os.environ["FAKE_ADB_SCREENCAP_FAIL_AFTER"] = "2"
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=executed", headers["Location"])
+        record = self.server.approvals.get(key)
+        self.assertEqual(record["state"], "executed")
+        self.assertEqual(record["detail"], "executed_no_shot")
+        self.assertIsNone(record["postshot"])
+        _, polled = self.result(key)
+        self.assertEqual(
+            json.loads(polled["result"]["content"][0]["text"])["state"],
+            "executed",
+        )
+        self.assertEqual(len(polled["result"]["content"]), 1)
+        _, page, _ = self.req("GET", "/control", cookie)
+        self.assertIn(
+            "Executed — post-action screenshot unavailable",
+            page.decode("utf-8"),
+        )
+
+    def test_approved_result_is_shown_on_the_panel(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        _, page, _ = self.req("GET", "/control", cookie)
+        text = page.decode("utf-8")
+        self.assertIn("Recent results", text)
+        self.assertIn("Executed — Tap (540, 780)", text)
+        self.assertIn("AI reason:", text)
+        self.assertIn("data:image/png;base64,", text)
+
+
+    def test_control_ttl_is_fifteen_minutes(self):
+        self.assertEqual(bridge.CONTROL_SESSION_TTL_SECONDS, 15 * 60)
+        self.start_control()
+        self.assertGreater(
+            self.server.control_expires, time.monotonic() + 14 * 60
+        )
+
+    def test_crosshair_math_is_percentage_based(self):
+        for x, y, width, height, expected in (
+            (960, 600, 1920, 1200, "left:50.0000%;top:50.0000%"),
+            (1919, 1199, 1920, 1200, "left:99.9479%;top:99.9167%"),
+        ):
+            with self.subTest(x=x, y=y):
+                html = bridge.Handler._crosshair_html(
+                    None, x, y, width, height
+                )
+                self.assertIn(expected, html)
+
+    def test_proposal_stores_identity_transport_and_screen(self):
+        self.start_control()
+        self.new_proposal()
+        record = self.server.approvals.pending()[0]
+        self.assertEqual(record["hardware_serial"], "R5CT12345678")
+        self.assertEqual(record["device"], "192.168.1.50:41234")
+        self.assertEqual((record["width"], record["height"]), (1920, 1200))
+        self.assertEqual(record["orientation"], "Landscape")
+        self.assertEqual(record["action"]["reason"], "test harmlessly")
+
+    def test_control_off_blocks_exposed_tap(self):
+        self.assertIn("android_tap", self.server.exposed_tools)
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 60
+        self.server.control_active = False
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "blocked"}
+        )
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "control_session_inactive"
+        )
+
+
+    def test_concurrent_proposal_is_refused(self):
+        self.start_control()
+        self.server.proposal_lock.acquire()
+        try:
+            _, payload = self.propose(
+                "android_tap", {"x": 10, "y": 20, "reason": "busy"}
+            )
+        finally:
+            self.server.proposal_lock.release()
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "proposal_busy"
+        )
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_proposal_uses_capture_rate_limiter(self):
+        self.start_control()
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times[:] = [time.monotonic()]
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "rate"}
+        )
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "rate_limited"
+        )
+
+    def test_reject_does_not_reset_the_cooldown(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.ctl("/control/reject", {"id": key}, cookie, csrf)
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "still cooling"}
+        )
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "proposal_cooldown"
+        )
+
+    def test_swipe_and_text_validation_are_unchanged(self):
+        self.assertEqual(
+            control_actions.validate_swipe(1, 2, 3, 4)["type"], "swipe"
+        )
+        self.assertEqual(
+            control_actions.validate_text("hello")["type"], "text"
+        )
+
+
+    def test_stop_during_proposal_is_refused(self):
+        cookie, csrf = self.start_control()
+        os.environ["FAKE_ADB_SCREENCAP_SLEEP"] = "0.5"
+        result = {}
+
+        def worker():
+            result["payload"] = self.propose(
+                "android_tap", {"x": 10, "y": 20, "reason": "in flight"}
+            )[1]
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        time.sleep(0.15)
+        self.ctl("/control/stop", {}, cookie, csrf)
+        thread.join(timeout=10)
+        payload = result["payload"]
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "control_session_inactive"
+        )
+        self.assertEqual(self.server.approvals.pending(), [])
+        self.assertNotIn("'input'", self.adb_log())
+
+
+    def test_result_labels_cover_final_states(self):
+        cases = (
+            ({"state": "executed", "postshot": b"x", "detail": ""}, "Executed"),
+            ({"state": "executed", "postshot": None,
+              "detail": "executed_no_shot"},
+             "Executed — post-action screenshot unavailable"),
+            ({"state": "rejected", "detail": ""}, "Rejected"),
+            ({"state": "expired", "detail": ""}, "Expired"),
+            ({"state": "failed", "detail": "screen_changed"},
+             "Failed — Screen changed — ask again."),
+            ({"state": "failed", "detail": "identity_mismatch"},
+             "Failed — Device identity changed."),
+        )
+        for record, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    bridge.Handler._result_label(None, record), expected
+                )
+
+    def test_completed_history_is_bounded(self):
+        approvals = control_actions.Approvals(max_pending=3)
+        action = control_actions.validate_tap(1, 1, 100, 100, "history")
+        for _ in range(25):
+            record = approvals.create(
+                action, "transport", b"shot", 100, 100, "Square", "hardware"
+            )
+            approvals.complete(record["id"], b"post")
+        self.assertLessEqual(len(approvals.records), 20)
+        self.assertEqual(len(approvals.recent(5)), 5)
+
+
+    def test_expired_does_not_reset_the_cooldown(self):
+        self.start_control()
+        key = self.new_proposal()
+        self.server.approvals.get(key)["expires"] = time.monotonic() - 1
+        self.server.approvals.pending()
+        _, payload = self.propose(
+            "android_tap", {"x": 10, "y": 20, "reason": "expired cooldown"}
+        )
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "proposal_cooldown"
+        )
 
 
 if __name__ == "__main__":

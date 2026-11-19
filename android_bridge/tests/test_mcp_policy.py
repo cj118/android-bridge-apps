@@ -164,7 +164,7 @@ class McpPolicyTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["serverInfo"]["name"], "android-bridge")
-        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.3.18")
+        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.3.19")
 
     def test_12_allowlisted_tools_list_with_viewing_off(self):
         server = self.start()
