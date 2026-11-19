@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.3"
+VERSION = "0.3.5"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -937,7 +937,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/control/stop":
                 # Emergency stop: a valid CSRF-bound session, or the bearer token.
-                if nonce and self._ui_csrf_ok(nonce, csrf) and self._origin_ok():
+                if (
+                    nonce
+                    and self._ui_csrf_ok(nonce, csrf)
+                    and self._origin_error(nonce) is None
+                ):
                     self._do_stop()
                     return
                 if self._authorized(fields.get("token")):
@@ -952,8 +956,9 @@ class Handler(BaseHTTPRequestHandler):
             if not self._ui_csrf_ok(nonce, csrf):
                 self._control_denied("csrf")
                 return
-            if not self._origin_ok():
-                self._control_denied("origin")
+            blocked = self._origin_error(nonce)
+            if blocked:
+                self._control_denied(blocked)
                 return
 
             if path == "/control/session":
@@ -1018,24 +1023,47 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(session["csrf"], provided)
 
-    def _origin_ok(self):
-        """Accept same-origin browser posts through the Home Assistant ingress.
+    @staticmethod
+    def _normalise_origin(value):
+        """Return scheme://host[:port] in lower case, or None if unusable."""
+        if not value:
+            return None
+        value = value.strip()
+        if not value or value.lower() == "null":
+            return None
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return None
+        return "%s://%s" % (parsed.scheme, parsed.netloc.lower())
 
-        HA ingress forwards Sec-Fetch-Site and X-Forwarded-Host and may drop or
-        rewrite Origin/Host, so Origin equality alone cannot be trusted here.
-        The session cookie and the session-bound CSRF token remain mandatory.
+    def _origin_error(self, nonce):
+        """Cross-site rejection bound to the origin that created the session.
+
+        Host and X-Forwarded-Host are rewritten by the Home Assistant ingress and
+        by any upstream proxy, so they are not trust anchors. The browser Origin
+        captured at sign-in is. Sec-Fetch-Site, when the browser sends it, is
+        authoritative and overrides nothing else.
         """
         site = self.headers.get("Sec-Fetch-Site")
         if site in ("same-origin", "none"):
-            return True
-        origin = self.headers.get("Origin")
-        if not origin:
-            return True
-        expected = (
-            self.headers.get("X-Forwarded-Host")
-            or self.headers.get("Host", "")
-        )
-        return bool(expected) and urllib.parse.urlparse(origin).netloc == expected
+            return None
+        if site == "cross-site":
+            return "cross_site"
+
+        raw = self.headers.get("Origin")
+        presented = self._normalise_origin(raw)
+        if raw is not None and presented is None:
+            if raw.strip().lower() == "null":
+                return "origin_null"
+            return "origin_invalid"
+
+        session = self.server.ui_sessions.get(nonce) or {}
+        bound = session.get("origin")
+        if bound is None:
+            return None if presented is None else "origin_unbound"
+        if presented != bound:
+            return "origin_mismatch"
+        return None
 
     def _send_html_with(self, body, headers=None):
         self.send_response(200)
@@ -1052,12 +1080,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_auth(fields.get("token")):
             return
         nonce = secrets.token_hex(16)
+        bound_origin = self._normalise_origin(self.headers.get("Origin"))
         csrf = hmac.new(
             self.server.token, (nonce + ":csrf").encode("ascii"), "sha256"
         ).hexdigest()[:32]
         self.server.ui_sessions[nonce] = {
             "expires": time.monotonic() + UI_SESSION_TTL_SECONDS,
             "csrf": csrf,
+            "origin": bound_origin,
         }
         signature = hmac.new(
             self.server.token, nonce.encode("ascii"), "sha256"
