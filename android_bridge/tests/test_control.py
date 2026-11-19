@@ -48,6 +48,12 @@ if args and args[0] == "connect":
     sys.exit(0)
 if args and args[0] == "disconnect":
     sys.exit(0)
+if "-s" in args and "get-serialno" in args:
+    print(os.environ.get("FAKE_ADB_SERIAL", "192.168.1.50:41234"))
+    sys.exit(0)
+if "-s" in args and "getprop" in args:
+    print(os.environ.get("FAKE_ADB_MODEL", "SM_X210"))
+    sys.exit(0)
 if "-s" in args and "exec-out" in args:
     with open(os.environ["FAKE_ADB_PNG"], "rb") as fh:
         sys.stdout.buffer.write(fh.read())
@@ -82,6 +88,13 @@ class ControlSecurityTests(unittest.TestCase):
 
         cls.data_dir = os.path.join(cls.tmp, "data")
         os.makedirs(cls.data_dir, 0o700)
+        # Phase-3 work still exercises the approval flow: this fixture opts in
+        # to the full known tool set explicitly, as a future release would.
+        os.makedirs(bridge.private_dir(cls.data_dir), mode=0o700, exist_ok=True)
+        tools_target = bridge.tools_path(cls.data_dir)
+        with open(tools_target, "w", encoding="utf-8") as fh:
+            json.dump({"expose_tools": sorted(bridge.KNOWN_MCP_TOOLS)}, fh)
+        os.chmod(tools_target, 0o600)
         cls.server = bridge.create_server("127.0.0.1", 0, data_dir=cls.data_dir)
         cls.port = cls.server.server_address[1]
         bridge.save_device(cls.data_dir, "192.168.1.50", "41234")
@@ -1081,6 +1094,31 @@ class ControlSecurityTests(unittest.TestCase):
         status, page, _ = self.follow(headers["Location"], cookie)
         self.assertEqual(status, 200)
         self.assertIn(b"Tablet paired and connected", page)
+
+    def test_pair_saves_the_device_identity(self):
+        cookie, csrf = self.start_control()
+        status, _, _ = self.ctl(
+            "/pair",
+            {"host": "192.168.1.50", "pairing_port": "37123",
+             "code": "123456", "connect_port": "41234"},
+            cookie, csrf,
+        )
+        self.assertEqual(status, 303)
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["serial"], "192.168.1.50:41234")
+        self.assertEqual(info["model"], "SM_X210")
+
+    def test_connect_saves_the_device_identity(self):
+        cookie, csrf = self.start_control()
+        status, _, _ = self.ctl(
+            "/connect",
+            {"host": "192.168.1.50", "connect_port": "41234"},
+            cookie, csrf,
+        )
+        self.assertIn(status, (200, 303))
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["serial"], "192.168.1.50:41234")
+        self.assertEqual(info["model"], "SM_X210")
 
     def test_pair_rejects_bad_host_port_and_code(self):
         cookie, csrf = self.start_control()

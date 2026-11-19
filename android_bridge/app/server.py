@@ -26,8 +26,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import adbctl
 import control as control_actions
 import pngcheck
+import reconnect as reconnect_module
 
-VERSION = "0.3.13"
+VERSION = "0.3.14"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -83,6 +84,11 @@ _TRACKED_HEADERS = (
 )
 ACTION_SETTLE_SECONDS = 0.6
 _ALLOWLIST = {"ips": frozenset(), "at": 0.0}
+
+# MCP tools the server knows how to run. Exposure is configured separately;
+# the default is the read-only pair only.
+DEFAULT_EXPOSED_TOOLS = ("android_screenshot", "android_status")
+EXPOSE_TOOLS_FILENAME = "expose_tools.json"
 
 
 def _resolve_host_ips(host):
@@ -146,6 +152,10 @@ def token_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
 
 def device_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
     return os.path.join(private_dir(data_dir), "device.json")
+
+
+def tools_path(data_dir: str = DEFAULT_DATA_DIR) -> str:
+    return os.path.join(private_dir(data_dir), EXPOSE_TOOLS_FILENAME)
 
 
 def _ensure_private_dir(data_dir: str) -> str:
@@ -279,6 +289,54 @@ def load_or_create_token(data_dir: str = DEFAULT_DATA_DIR) -> bytes:
     return _read_token_file(path)
 
 
+def _safe_option_name(value):
+    """Reduce a configured tool name to log-safe characters."""
+    if not isinstance(value, str):
+        return "non_string"
+    cleaned = re.sub(r"[^A-Za-z0-9_.*-]", "", value)[:40]
+    return cleaned or "empty"
+
+
+def load_exposed_tools(data_dir: str = DEFAULT_DATA_DIR):
+    """Return the MCP tools this server may expose.
+
+    Only the private handoff written at startup is read. Missing, malformed,
+    loosely permissioned or wrongly typed settings fall back to the read-only
+    default. Unknown names are dropped and logged. An explicitly empty list
+    stays empty.
+    """
+    fallback = tuple(DEFAULT_EXPOSED_TOOLS)
+    path = tools_path(data_dir)
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return fallback
+        if info.st_uid != os.geteuid():
+            return fallback
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            return fallback
+        with open(path, "rb") as handle:
+            data = json.loads(handle.read(65536))
+    except (OSError, ValueError):
+        return fallback
+    if not isinstance(data, dict):
+        return fallback
+    values = data.get("expose_tools")
+    if not isinstance(values, list):
+        return fallback
+    selected = []
+    for value in values:
+        name = value.strip() if isinstance(value, str) else None
+        if name is None or name not in KNOWN_MCP_TOOLS:
+            sys.stderr.write(
+                "mcp_tool_ignored name=%s\n" % _safe_option_name(value)
+            )
+            continue
+        if name not in selected:
+            selected.append(name)
+    return tuple(selected)
+
+
 # --------------------------------------------------------------- device state
 
 
@@ -289,28 +347,58 @@ def load_device(data_dir: str = DEFAULT_DATA_DIR) -> dict:
         host = info.get("host")
         port = info.get("connect_port")
         if isinstance(host, str) and isinstance(port, str):
-            return {"host": host, "connect_port": port}
+            device = {"host": host, "connect_port": port}
+            for key in ("serial", "model"):
+                value = info.get(key)
+                if isinstance(value, str) and value.strip():
+                    device[key] = value.strip()
+            return device
     except (OSError, ValueError):
         pass
     return {}
 
 
-def save_device(data_dir: str, host: str, connect_port: str) -> None:
+def save_device(data_dir: str, host: str, connect_port: str, identity=None) -> None:
+    """Persist the target. Identity is only ever supplied by a panel connect."""
     _ensure_private_dir(data_dir)
     path = device_path(data_dir)
     temporary = path + ".tmp"
-    payload = json.dumps({"host": host, "connect_port": connect_port}).encode("utf-8")
+    payload = {"host": host, "connect_port": connect_port}
+    for key in ("serial", "model"):
+        value = (identity or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            payload[key] = value.strip()
+    encoded = json.dumps(payload).encode("utf-8")
     descriptor = os.open(
         temporary,
         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
     try:
-        os.write(descriptor, payload)
+        os.write(descriptor, encoded)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
     os.replace(temporary, path)
+
+
+def capture_identity(device):
+    """Read the identity saved by a human-initiated panel connect.
+
+    Falls back to what the device listing reported, so a connect is never
+    blocked by an identity read failure.
+    """
+    serial = device.get("serial", "")
+    model = device.get("model", "")
+    try:
+        serial = adbctl.get_serialno(serial) or serial
+    except adbctl.AdbError:
+        pass
+    try:
+        model = adbctl.get_model(serial) or model
+    except adbctl.AdbError:
+        pass
+    return {"serial": serial, "model": model}
 
 
 # ---------------------------------------------------------------- self-test
@@ -468,16 +556,27 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return time.monotonic() < expires
 
-    def _mcp_gate(self):
-        """Source allowlist AND an open Viewing session, whatever the headers say.
+    def _mcp_source_ok(self):
+        """Only the TCP peer address counts. Forwarding headers are ignored."""
+        return mcp_source_allowed(self.client_address[0])
 
-        A bearer token is never accepted as a substitute for either control.
-        """
-        if not mcp_source_allowed(self.client_address[0]):
-            return False, "unauthorized"
-        if not self._viewing_open():
-            return False, "viewing_session_closed"
-        return True, None
+    def _mcp_deny(self, error):
+        time.sleep(AUTH_FAIL_DELAY_SECONDS)
+        status = 401 if error == "unauthorized" else 403
+        self._send_json(
+            status,
+            {"error": error},
+            {"WWW-Authenticate": 'Bearer realm="android-bridge"'},
+        )
+
+    _MCP_PASSIVE_METHODS = ("initialize", "tools/list", "ping")
+
+    def _mcp_passive(self, method):
+        """Discovery and protocol liveness. Never touches ADB or screen data."""
+        return (
+            method in self._MCP_PASSIVE_METHODS
+            or method.startswith("notifications/")
+        )
 
     def _require_auth(self, form_token=None) -> bool:
         if self._authorized(form_token):
@@ -509,18 +608,30 @@ class Handler(BaseHTTPRequestHandler):
             return "unreadable"
         return "ok"
 
+    def _resolve_target(self, host):
+        try:
+            devices = adbctl.list_devices()
+        except adbctl.AdbError:
+            return None
+        matches = [d for d in devices if d["serial"].startswith(host + ":")]
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
     def _resolve_device(self):
         info = load_device(self.server.data_dir)
         if not info:
             return info, None
-        try:
-            devices = adbctl.list_devices()
-        except adbctl.AdbError:
-            return info, None
-        matches = [d for d in devices if d["serial"].startswith(info["host"] + ":")]
-        if len(matches) != 1:
-            return info, None
-        return info, matches[0]
+        return info, self._resolve_target(info["host"])
+
+    def _resolve_after_reconnect(self):
+        """Resolve the device, trying one bounded reconnect if it is absent."""
+        info, device = self._resolve_device()
+        if device is not None or not info:
+            return info, device
+        if self.server.reconnector.lazy(info):
+            return self._resolve_device()
+        return info, None
 
     # ---------- GET ----------
 
@@ -572,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
             device = None
             if info:
                 try:
-                    _info, device = self._resolve_device()
+                    _info, device = self._resolve_after_reconnect()
                 except adbctl.AdbError:
                     device = None
             self._send_json(
@@ -631,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
             info = load_device(self.server.data_dir)
             if not info:
                 return None, "device_not_paired"
-            _info, device = self._resolve_device()
+            _info, device = self._resolve_after_reconnect()
             if device is None:
                 self._end_sessions()
                 return None, "device_not_connected"
@@ -740,26 +851,40 @@ class Handler(BaseHTTPRequestHandler):
         },
     ]
 
-    def _handle_mcp(self, body):
+    def _handle_mcp_gated(self, body):
+        """Source allowlist for everything; Viewing for everything but discovery.
+
+        A bearer token is never accepted as a substitute for either control.
+        """
+        if not self._mcp_source_ok():
+            self._mcp_deny("unauthorized")
+            return
+
+        message, error = self._parse_mcp(body)
+        if error is not None:
+            self._send_json(200, {"jsonrpc": "2.0", "id": None, "error": error})
+            return
+        if not self._mcp_passive(message["method"]) and not self._viewing_open():
+            self._mcp_deny("viewing_session_closed")
+            return
+        self._handle_mcp_message(message)
+
+    def _parse_mcp(self, body):
+        """Return (message, error) without logging or touching the device."""
         try:
             message = json.loads(body.decode("utf-8", "replace"))
         except ValueError:
-            self._send_json(
-                200,
-                {"jsonrpc": "2.0", "id": None,
-                 "error": {"code": -32700, "message": "parse error"}},
-            )
-            return
+            return None, {"code": -32700, "message": "parse error"}
+        if (
+            not isinstance(message, dict)
+            or message.get("jsonrpc") != "2.0"
+            or not isinstance(message.get("method"), str)
+        ):
+            return None, {"code": -32600, "message": "invalid request"}
+        return message, None
 
-        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0" or "method" not in message:
-            self._send_json(
-                200,
-                {"jsonrpc": "2.0", "id": None,
-                 "error": {"code": -32600, "message": "invalid request"}},
-            )
-            return
-
-        method = message.get("method")
+    def _handle_mcp_message(self, message):
+        method = message["method"]
         message_id = message.get("id")
 
         if method.startswith("notifications/"):
@@ -775,7 +900,7 @@ class Handler(BaseHTTPRequestHandler):
                 "serverInfo": {"name": "android-bridge", "version": VERSION},
             }
         elif method == "tools/list":
-            result = {"tools": self.MCP_TOOLS}
+            result = {"tools": self._advertised_tools()}
         elif method == "ping":
             result = {}
         elif method == "tools/call":
@@ -791,15 +916,29 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send_json(200, {"jsonrpc": "2.0", "id": message_id, "result": result})
 
+    def _advertised_tools(self):
+        exposed = self.server.exposed_tools
+        return [tool for tool in self.MCP_TOOLS if tool["name"] in exposed]
+
     def _mcp_tool_call(self, message, message_id):
         params = message.get("params") or {}
         if not isinstance(params, dict):
             params = {}
         name = params.get("name")
 
+        # Enforced before any device, capture or input work. Not-exposed and
+        # unknown names share one answer so exposure cannot be probed.
+        if not isinstance(name, str) or name not in self.server.exposed_tools:
+            self._send_json(
+                200,
+                {"jsonrpc": "2.0", "id": message_id,
+                 "error": {"code": -32602, "message": "unknown tool"}},
+            )
+            return
+
         if name == "android_status":
             info = load_device(self.server.data_dir)
-            _info, device = self._resolve_device()
+            _info, device = self._resolve_after_reconnect()
             payload = {
                 "paired": bool(info),
                 "connected": device is not None,
@@ -972,17 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
     def _route_post(self, body: bytes):
         path = self._path_only()
         if path == "/mcp":
-            allowed, error = self._mcp_gate()
-            if not allowed:
-                time.sleep(AUTH_FAIL_DELAY_SECONDS)
-                status = 401 if error == "unauthorized" else 403
-                self._send_json(
-                    status,
-                    {"error": error},
-                    {"WWW-Authenticate": 'Bearer realm="android-bridge"'},
-                )
-                return
-            self._handle_mcp(body)
+            self._handle_mcp_gated(body)
             return
         if path not in (
             "/pair", "/connect", "/disconnect", "/window",
@@ -1659,8 +1788,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._respond({"error": "pairing_failed"}, 400, flash="pair_failed")
             return
+        device = self._resolve_target(host)
+        identity = capture_identity(device) if device is not None else None
         try:
-            save_device(self.server.data_dir, host, connect_port)
+            save_device(self.server.data_dir, host, connect_port, identity)
         except OSError:
             self._send_json(500, {"error": "state_write_failed"})
             return
@@ -1678,8 +1809,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._respond({"error": "connect_failed"}, 400, flash="pair_failed")
             return
+        device = self._resolve_target(host)
+        identity = capture_identity(device) if device is not None else None
         try:
-            save_device(self.server.data_dir, host, port)
+            save_device(self.server.data_dir, host, port, identity)
         except OSError:
             self._send_json(500, {"error": "state_write_failed"})
             return
@@ -1707,6 +1840,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._reject_method()
+
+
+# Every tool implementation present in this build. Exposure is a separate,
+# server-side decision and never widens this set.
+KNOWN_MCP_TOOLS = frozenset(tool["name"] for tool in Handler.MCP_TOOLS)
 
 
 class BridgeServer(ThreadingHTTPServer):
@@ -1752,8 +1890,10 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.ui_sessions = {}
     server.login_nonces = {}
     server.allowed_users = load_allowed_users(data_dir)
+    server.exposed_tools = load_exposed_tools(data_dir)
     server.control_lock = threading.Lock()
     server.approvals = control_actions.Approvals()
+    server.reconnector = reconnect_module.Reconnector()
     server.started_monotonic = time.monotonic()
     return server
 
@@ -1792,6 +1932,29 @@ def _log_adb_version():
         sys.stderr.write("adb missing\n")
 
 
+def startup_reconnect(server):
+    """Reconnect to the saved tablet, if any.
+
+    Returns True only when the saved identity is verified. Failures are logged
+    by the reconnector; the scheduler keeps any unexpected error away from boot.
+    """
+    info = load_device(server.data_dir)
+    if not info:
+        return False
+    return server.reconnector.startup(info)
+
+
+def _schedule_startup_reconnect(server):
+    def worker():
+        try:
+            startup_reconnect(server)
+        except Exception:
+            # A failed reconnect must never stop the bridge starting.
+            sys.stderr.write("adb reconnect failed reason=unknown\n")
+
+    threading.Thread(target=worker, name="adb-reconnect", daemon=True).start()
+
+
 def main() -> int:
     if os.geteuid() == 0:
         sys.stderr.write("android-bridge: fatal: refusing to run as root\n")
@@ -1810,9 +1973,10 @@ def main() -> int:
     _log_adb_version()
     _log_adb_key_state(DEFAULT_DATA_DIR)
     sys.stderr.write(
-        "android-bridge %s listening on %d (bearer auth enabled)\n"
+        "android-bridge %s listening on %d (HA-user panel, MCP source+viewing gate)\n"
         % (VERSION, PORT)
     )
+    _schedule_startup_reconnect(server)
     _schedule_auth_selftest(server, server.server_address[1])
     try:
         server.serve_forever()

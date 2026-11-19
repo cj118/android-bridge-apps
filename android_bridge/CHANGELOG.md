@@ -1,5 +1,41 @@
 # Android Bridge changelog
 
+## 0.3.14
+
+- Automatic reconnect to the saved tablet. At startup, after the adb key check,
+  `/data/private/device.json` is used to run `adb connect` to the saved host and
+  connect port only, as the application user. Host and port are validated before
+  adb runs; pairing is never started automatically. At most three attempts with
+  short backoff and bounded command timeouts; failure never blocks startup.
+- A successful `adb connect` is not trusted on its own. The saved identity
+  (`serial` from adb `get-serialno`, `ro.product.model`) must match before the
+  reconnect counts as successful. Identity is only written by a human-initiated
+  pair/connect from the control panel, never by a reconnect.
+- A record created before identities existed stores only host and connect port.
+  For that record a reconnect accepts one device whose model is `SM_X210` and
+  logs `adb reconnect identity unverified`; the real identity is saved the next
+  time the tablet is connected from the panel.
+- `android_status` and `android_screenshot` (and `/status`, `/screenshot`) make one
+  lazy reconnect attempt when the saved device is missing, rate-limited so
+  concurrent requests cannot cause repeated attempts.
+- Reconnect logging is limited to `adb reconnect ok`,
+  `adb reconnect identity unverified` (legacy record only) and
+  `adb reconnect failed reason=<category>`. Keys, targets and codes are never
+  logged.
+- MCP discovery works with Viewing OFF: the allowlisted OpenCode source may call
+  `initialize`, `tools/list`, `ping` and notifications. Every `tools/call`,
+  including `android_status` and `android_screenshot`, still requires the source
+  allowlist AND an open Viewing session.
+- New app option `expose_tools` (default `["android_screenshot",
+  "android_status"]`). `tools/list` advertises only exposed tools and
+  `tools/call` rejects anything else before any Android operation. Unknown names
+  are dropped and logged; duplicates are collapsed; missing or invalid settings
+  fall back to the read-only default; an empty list exposes nothing. Tap, swipe,
+  text and action-result implementations remain in the codebase but are not
+  exposed by default and still require the existing approval process.
+- Startup log now says `(HA-user panel, MCP source+viewing gate)` instead of the
+  misleading `(bearer auth enabled)`. Authentication is unchanged.
+
 ## 0.3.13
 
 - Every MCP request now requires both the allowlisted OpenCode source address and

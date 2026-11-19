@@ -14,6 +14,7 @@ import subprocess
 ADB_BINARY = os.environ.get("BRIDGE_ADB_BINARY", "adb")
 DEFAULT_TIMEOUT = 20.0
 PAIR_TIMEOUT = 30.0
+IDENTITY_TIMEOUT = 5.0
 MAX_OUTPUT_BYTES = 12 * 1024 * 1024
 
 _HOST_RE = re.compile(r"\A[A-Za-z0-9.-]{1,253}\Z")
@@ -191,6 +192,31 @@ def list_devices(timeout: float = 10.0):
                 info[key] = value
         devices.append({"serial": parts[0], "model": info.get("model", "")})
     return devices
+
+
+def get_serialno(serial: str, timeout: float = IDENTITY_TIMEOUT) -> str:
+    """Return the device's adb serial. Fixed command, no caller arguments."""
+    returncode, out, _err = _run(
+        ["-s", _serial(serial), "get-serialno"], timeout=timeout, max_bytes=4096
+    )
+    if returncode != 0:
+        raise AdbError("identity unavailable")
+    value = out.decode("utf-8", "replace").strip()
+    if not _SERIAL_RE.match(value):
+        raise AdbError("identity unavailable")
+    return value
+
+
+def get_model(serial: str, timeout: float = IDENTITY_TIMEOUT) -> str:
+    """Read ro.product.model. Fixed, read-only property; no caller arguments."""
+    returncode, out, _err = _run(
+        ["-s", _serial(serial), "shell", "getprop", "ro.product.model"],
+        timeout=timeout,
+        max_bytes=4096,
+    )
+    if returncode != 0:
+        raise AdbError("identity unavailable")
+    return out.decode("utf-8", "replace").strip()[:64]
 
 
 def screencap(serial: str, timeout: float = DEFAULT_TIMEOUT):

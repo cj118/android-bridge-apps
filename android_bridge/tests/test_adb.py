@@ -253,7 +253,7 @@ class ScreenshotTests(unittest.TestCase):
         status, payload = self.mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in payload["result"]["tools"])
-        self.assertEqual(names, ["android_action_result", "android_screenshot", "android_status", "android_swipe", "android_tap", "android_text"])
+        self.assertEqual(names, ["android_screenshot", "android_status"])
 
     def test_mcp_screenshot_returns_image_content(self):
         status, payload = self.mcp(
@@ -316,7 +316,7 @@ class ScreenshotTests(unittest.TestCase):
             self._restore_allowlist(original)
         self.assertEqual(status, 200)
         names = sorted(t["name"] for t in payload["result"]["tools"])
-        self.assertEqual(names, ["android_action_result", "android_screenshot", "android_status", "android_swipe", "android_tap", "android_text"])
+        self.assertEqual(names, ["android_screenshot", "android_status"])
 
     def test_mcp_rejects_unknown_source_without_token(self):
         original = self._with_allowlist(set())
@@ -344,21 +344,23 @@ class ScreenshotTests(unittest.TestCase):
         self.assertEqual(status, 200)
 
 
-    def test_mcp_without_window_is_403(self):
+    def test_mcp_without_window_denies_tools_call(self):
         self.server.viewing_active = False
         original = self._with_allowlist({"127.0.0.1"})
         try:
             status, body, _ = self.request(
                 "POST", "/mcp",
                 {"Content-Type": "application/json"},
-                json.dumps({"jsonrpc": "2.0", "id": 20, "method": "tools/list"}).encode(),
+                json.dumps({"jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                            "params": {"name": "android_status",
+                                       "arguments": {}}}).encode(),
             )
         finally:
             self._restore_allowlist(original)
         self.assertEqual(status, 403)
         self.assertIn(b"viewing_session_closed", body)
 
-    def test_mcp_stopped_session_is_403(self):
+    def test_mcp_stopped_session_denies_tools_call(self):
         original = self._with_allowlist({"127.0.0.1"})
         try:
             self._open_window()
@@ -366,7 +368,9 @@ class ScreenshotTests(unittest.TestCase):
             status, _, _ = self.request(
                 "POST", "/mcp",
                 {"Content-Type": "application/json"},
-                json.dumps({"jsonrpc": "2.0", "id": 21, "method": "tools/list"}).encode(),
+                json.dumps({"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                            "params": {"name": "android_status",
+                                       "arguments": {}}}).encode(),
             )
         finally:
             self._restore_allowlist(original)

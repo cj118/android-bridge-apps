@@ -101,6 +101,76 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(bridge.load_allowed_users(self.data_dir), frozenset())
 
 
+class ToolHandoffTests(unittest.TestCase):
+    """expose_tools crosses the root-only boundary in its own 0600 file."""
+
+    def setUp(self):
+        self.data_dir = tempfile.mkdtemp(prefix="bridge-opt-tools-")
+        os.makedirs(bridge.private_dir(self.data_dir), mode=0o700)
+        self.options = os.path.join(self.data_dir, "options.json")
+        self.target = os.path.join(bridge.private_dir(self.data_dir), "allowed_users.json")
+        self.tools = os.path.join(bridge.private_dir(self.data_dir), "expose_tools.json")
+
+    def write_options(self, payload):
+        with open(self.options, "w", encoding="utf-8") as handle:
+            if isinstance(payload, str):
+                handle.write(payload)
+            else:
+                json.dump(payload, handle)
+        os.chmod(self.options, 0o600)
+
+    def extract(self):
+        options_bridge.extract(
+            self.options, self.target, os.geteuid(), os.getegid()
+        )
+
+    def read_tools(self):
+        with open(self.tools, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_explicit_list_is_handed_over_unchanged(self):
+        self.write_options({"expose_tools": ["android_status", "android_status"]})
+        self.extract()
+        self.assertEqual(
+            self.read_tools(), {"expose_tools": ["android_status", "android_status"]}
+        )
+        info = os.lstat(self.tools)
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+
+    def test_empty_list_stays_empty(self):
+        self.write_options({"expose_tools": []})
+        self.extract()
+        self.assertEqual(self.read_tools(), {"expose_tools": []})
+
+    def test_missing_setting_marks_default(self):
+        self.write_options({"allowed_ha_users": ["carlj"]})
+        self.extract()
+        self.assertEqual(self.read_tools(), {"expose_tools": None})
+        self.assertEqual(
+            bridge.load_exposed_tools(self.data_dir),
+            ("android_screenshot", "android_status"),
+        )
+
+    def test_wrong_type_marks_default(self):
+        self.write_options({"expose_tools": "android_tap"})
+        self.extract()
+        self.assertEqual(self.read_tools(), {"expose_tools": None})
+
+    def test_server_reads_a_tools_handoff(self):
+        self.write_options({"expose_tools": ["android_status"]})
+        self.extract()
+        self.assertEqual(bridge.load_exposed_tools(self.data_dir), ("android_status",))
+
+    def test_loose_tools_handoff_is_rejected(self):
+        self.write_options({"expose_tools": ["android_tap"]})
+        self.extract()
+        os.chmod(self.tools, 0o644)
+        self.assertEqual(
+            bridge.load_exposed_tools(self.data_dir),
+            ("android_screenshot", "android_status"),
+        )
+
+
 class AllowlistSignInTests(unittest.TestCase):
     """End-to-end: carlj from the handoff can sign in; others cannot."""
 
