@@ -26,7 +26,7 @@ import adbctl
 import control as control_actions
 import pngcheck
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -943,13 +943,17 @@ class Handler(BaseHTTPRequestHandler):
                 if self._authorized(fields.get("token")):
                     self._do_stop()
                     return
-                time.sleep(AUTH_FAIL_DELAY_SECONDS)
-                self._send_json(403, {"error": "forbidden"})
+                self._control_denied("stop")
                 return
 
-            if not nonce or not self._ui_csrf_ok(nonce, csrf) or not self._origin_ok():
-                time.sleep(AUTH_FAIL_DELAY_SECONDS)
-                self._send_json(403, {"error": "forbidden"})
+            if not nonce:
+                self._control_denied("session")
+                return
+            if not self._ui_csrf_ok(nonce, csrf):
+                self._control_denied("csrf")
+                return
+            if not self._origin_ok():
+                self._control_denied("origin")
                 return
 
             if path == "/control/session":
@@ -984,7 +988,11 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- human control surface ----------
 
     def _ui_session(self):
-        """Return the validated UI session nonce, or None."""
+        """Return the first validated UI session nonce, or None.
+
+        Browsers can hold several ab_ui cookies (different ingress paths, or
+        left over from an earlier build). A stale one must not mask a live one.
+        """
         header = self.headers.get("Cookie", "")
         for part in header.split(";"):
             name, _, value = part.strip().partition("=")
@@ -992,15 +1000,15 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             nonce, _, signature = value.partition(".")
             if not nonce or not signature:
-                return None
+                continue
             expected = hmac.new(
                 self.server.token, nonce.encode("ascii", "ignore"), "sha256"
             ).hexdigest()
             if not hmac.compare_digest(expected, signature):
-                return None
+                continue
             session = self.server.ui_sessions.get(nonce)
             if not session or session["expires"] <= time.monotonic():
-                return None
+                continue
             return nonce
         return None
 
@@ -1085,6 +1093,12 @@ class Handler(BaseHTTPRequestHandler):
                 "control": self.server.control_active,
             },
         )
+
+    def _control_denied(self, reason):
+        """Log which guard rejected the request. Never logs header values."""
+        sys.stderr.write("control_forbidden reason=%s\n" % reason)
+        time.sleep(AUTH_FAIL_DELAY_SECONDS)
+        self._send_json(403, {"error": "forbidden"})
 
     def _do_stop(self):
         with self.server.control_lock:

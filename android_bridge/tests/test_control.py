@@ -1,6 +1,8 @@
 """Approval security: UI session, CSRF, binding, replay, expiry, STOP."""
 
 import base64
+import contextlib
+import io
 import json
 import os
 import re
@@ -384,6 +386,50 @@ class ControlSecurityTests(unittest.TestCase):
         status, _, headers = self.req("GET", "/index.html")
         self.assertEqual(status, 302)
         self.assertEqual(headers.get("Location"), "/control")
+
+
+    def test_stale_cookie_does_not_mask_valid_one(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        combined = "ab_ui=%s.%s; %s" % ("a" * 32, "b" * 64, cookie["Cookie"])
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {"Cookie": combined, "Origin": "https://ha.example",
+             "X-Forwarded-Host": "ha.example"},
+        )
+        self.assertEqual(status, 200)
+
+    def test_missing_session_reason_is_logged(self):
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            self.form(
+                "/control/approve", {"id": "deadbeef"},
+                {"Origin": "https://ha.example", "X-Forwarded-Host": "ha.example"},
+            )
+        self.assertIn("control_forbidden reason=session", capture.getvalue())
+
+    def test_csrf_reason_is_logged(self):
+        cookie, _ = self.start_control()
+        key = self.new_proposal()
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            self.form(
+                "/control/approve", {"id": key},
+                {**cookie, "Origin": "https://ha.example",
+                 "X-Forwarded-Host": "ha.example"},
+            )
+        self.assertIn("control_forbidden reason=csrf", capture.getvalue())
+
+    def test_origin_reason_is_logged(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            self.form(
+                "/control/approve", {"id": key, "csrf": csrf},
+                {**cookie, "Origin": "https://evil.example"},
+            )
+        self.assertIn("control_forbidden reason=origin", capture.getvalue())
 
 
 if __name__ == "__main__":
