@@ -39,6 +39,18 @@ if args and args[0] == "devices":
 if args and args[0] == "connect":
     print("connected to " + args[1])
     sys.exit(0)
+if len(args) > 4 and args[2:4] == ["shell", "uiautomator"]:
+    if not os.environ.get("FAKE_ADB_UI_DUMP"):
+        sys.exit(7)
+    print("UI hierchary dumped to: /sdcard/window_dump.xml")
+    sys.exit(0)
+if len(args) > 3 and args[2] == "exec-out" and args[3] == "cat":
+    path = os.environ.get("FAKE_ADB_UI_DUMP")
+    if not path:
+        sys.exit(7)
+    with open(path, "rb") as fh:
+        sys.stdout.buffer.write(fh.read())
+    sys.exit(0)
 if "-s" in args and "exec-out" in args:
     with open(os.environ["FAKE_ADB_PNG"], "rb") as fh:
         sys.stdout.buffer.write(fh.read())
@@ -47,6 +59,17 @@ if len(args) > 4 and args[2:4] == ["shell", "input"]:
     sys.exit(0)
 sys.exit(2)
 '''
+
+UI_DUMP = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1080,2400]" clickable="false" visible-to-user="true">
+    <node index="0" text="Kitchen" resource-id="com.x:id/kitchen"
+          class="android.widget.Button" bounds="[100,200][500,400]"
+          clickable="true" visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
 
 UNSET = object()
 PNG = (
@@ -70,6 +93,9 @@ class McpPolicyTests(unittest.TestCase):
         os.chmod(self.adb, 0o755)
         self.log_path = os.path.join(self.tmp, "adb.log")
         open(self.log_path, "w").close()
+        self.ui_dump_path = os.path.join(self.tmp, "window_dump.xml")
+        with open(self.ui_dump_path, "w", encoding="utf-8") as handle:
+            handle.write(UI_DUMP)
 
         self._orig_binary = adbctl.ADB_BINARY
         adbctl.ADB_BINARY = self.adb
@@ -78,12 +104,18 @@ class McpPolicyTests(unittest.TestCase):
         adbctl.reset_server_state()
         self._saved_env = {
             key: os.environ.get(key)
-            for key in ("FAKE_ADB_LOG", "FAKE_ADB_SERIAL", "FAKE_ADB_PNG")
+            for key in (
+                "FAKE_ADB_LOG",
+                "FAKE_ADB_SERIAL",
+                "FAKE_ADB_PNG",
+                "FAKE_ADB_UI_DUMP",
+            )
         }
         os.environ.update({
             "FAKE_ADB_LOG": self.log_path,
             "FAKE_ADB_SERIAL": "192.168.1.50:41234",
             "FAKE_ADB_PNG": self.png_path,
+            "FAKE_ADB_UI_DUMP": self.ui_dump_path,
         })
         self.servers = []
 
@@ -164,14 +196,17 @@ class McpPolicyTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["serverInfo"]["name"], "android-bridge")
-        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.3.20")
+        self.assertEqual(payload["result"]["serverInfo"]["version"], "0.3.21")
 
     def test_12_allowlisted_tools_list_with_viewing_off(self):
         server = self.start()
         status, payload = self.list_tools(server)
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in payload["result"]["tools"])
-        self.assertEqual(names, ["android_screenshot", "android_status"])
+        self.assertEqual(
+            names,
+            ["android_screenshot", "android_status", "android_ui_elements"],
+        )
 
     def test_13_tools_call_denied_with_viewing_off(self):
         server = self.start()
@@ -233,11 +268,15 @@ class McpPolicyTests(unittest.TestCase):
     def test_19_default_exposes_only_screenshot_and_status(self):
         server = self.start()
         self.assertEqual(
-            tuple(server.exposed_tools), ("android_screenshot", "android_status")
+            tuple(server.exposed_tools),
+            ("android_screenshot", "android_status", "android_ui_elements"),
         )
         _, payload = self.list_tools(server)
         names = sorted(tool["name"] for tool in payload["result"]["tools"])
-        self.assertEqual(names, ["android_screenshot", "android_status"])
+        self.assertEqual(
+            names,
+            ["android_screenshot", "android_status", "android_ui_elements"],
+        )
 
     def test_20_authorised_screenshot_still_works(self):
         server = self.start()
@@ -312,7 +351,8 @@ class McpPolicyTests(unittest.TestCase):
     def test_27_missing_setting_falls_back_to_read_only_default(self):
         server = self.start()
         self.assertEqual(
-            tuple(server.exposed_tools), ("android_screenshot", "android_status")
+            tuple(server.exposed_tools),
+            ("android_screenshot", "android_status", "android_ui_elements"),
         )
         self.viewing_on(server)
         _, payload = self.call(server, "android_tap", {"x": 1, "y": 2})
@@ -339,7 +379,7 @@ class McpPolicyTests(unittest.TestCase):
                 server = self.start(raw=raw)
                 self.assertEqual(
                     tuple(server.exposed_tools),
-                    ("android_screenshot", "android_status"),
+                    ("android_screenshot", "android_status", "android_ui_elements"),
                 )
                 self.viewing_on(server)
                 _, payload = self.call(server, "android_tap", {"x": 1, "y": 2})
@@ -354,7 +394,11 @@ class McpPolicyTests(unittest.TestCase):
         )
         _, payload = self.list_tools(server)
         names = [tool["name"] for tool in payload["result"]["tools"]]
-        self.assertEqual(names, ["android_screenshot", "android_status"])
+        self.assertEqual(
+            names,
+            ["android_screenshot", "android_status"],
+        )
+        self.assertNotIn("android_ui_elements", names)
         self.viewing_on(server)
         status, payload = self.call(server, "android_status")
         self.assertEqual(status, 200)
@@ -376,6 +420,51 @@ class McpPolicyTests(unittest.TestCase):
             source = handle.read()
         self.assertIn("(HA-user panel, MCP source+viewing gate)", source)
         self.assertNotIn("(bearer auth enabled)", source)
+
+
+    # ---------- 31-34: android_ui_elements (0.3.21) ----------
+
+    def test_31_ui_elements_requires_viewing(self):
+        server = self.start()
+        self.clear_adb()
+        status, payload = self.call(server, "android_ui_elements")
+        self.assertEqual(status, 403)
+        self.assertEqual(payload, {"error": "viewing_session_closed"})
+        self.assertEqual(self.adb_calls(), [])
+
+    def test_32_ui_elements_lists_targets_when_viewing_is_on(self):
+        server = self.start()
+        self.viewing_on(server)
+        status, payload = self.call(server, "android_ui_elements")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["result"]["isError"])
+        body = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(
+            body["elements"],
+            [{"name": "Kitchen", "bounds": [100, 200, 500, 400]}],
+        )
+        self.assertEqual(body["count"], 1)
+        self.assertFalse(body["truncated"])
+
+    def test_33_ui_elements_is_not_available_when_not_exposed(self):
+        server = self.start(expose=["android_screenshot", "android_status"])
+        self.viewing_on(server)
+        status, payload = self.call(server, "android_ui_elements")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            payload["error"], {"code": -32602, "message": "unknown tool"}
+        )
+
+    def test_34_ui_elements_reports_a_failed_dump(self):
+        server = self.start()
+        self.viewing_on(server)
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        status, payload = self.call(server, "android_ui_elements")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "ui_dump_failed"
+        )
 
 
 if __name__ == "__main__":

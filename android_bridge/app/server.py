@@ -29,7 +29,7 @@ import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.20"
+VERSION = "0.3.21"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -100,8 +100,12 @@ ACTION_SETTLE_SECONDS = 0.6
 _ALLOWLIST = {"ips": frozenset(), "at": 0.0}
 
 # MCP tools the server knows how to run. Exposure is configured separately;
-# the default is the read-only pair only.
-DEFAULT_EXPOSED_TOOLS = ("android_screenshot", "android_status")
+# the default is the read-only tools only.
+DEFAULT_EXPOSED_TOOLS = (
+    "android_screenshot",
+    "android_status",
+    "android_ui_elements",
+)
 EXPOSE_TOOLS_FILENAME = "expose_tools.json"
 
 
@@ -913,10 +917,24 @@ class Handler(BaseHTTPRequestHandler):
             },
         },
         {
+            "name": "android_ui_elements",
+            "description": (
+                "List visible clickable elements with names and bounds so a "
+                "target can be chosen instead of guessed. Read-only; needs "
+                "Viewing and a connected tablet."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "android_tap",
             "description": (
                 "Propose a tap. It does not execute: a human must approve it in "
-                "the bridge Control page. Poll android_action_result afterwards."
+                "the bridge Control page. The result names the element found at "
+                "the given point. Poll android_action_result afterwards."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1093,6 +1111,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"jsonrpc": "2.0", "id": message_id, "result": result})
             return
 
+        if name == "android_ui_elements":
+            self._mcp_ui_elements(message_id)
+            return
+
         if name in ("android_tap", "android_swipe", "android_text"):
             self._mcp_propose(name, params, message_id)
             return
@@ -1113,6 +1135,37 @@ class Handler(BaseHTTPRequestHandler):
             {"jsonrpc": "2.0", "id": message_id,
              "result": {"content": [{"type": "text", "text": text}], "isError": True}},
         )
+
+    def _mcp_ui_elements(self, message_id):
+        """Read-only target list. Viewing is enforced by the tools/call gate."""
+        _info, device = self._resolve_after_reconnect()
+        if device is None:
+            self._mcp_error(message_id, "device_not_connected")
+            return
+        try:
+            xml = adbctl.ui_dump(device["serial"])
+        except adbctl.AdbError as exc:
+            if str(exc) == "timeout":
+                self._mcp_error(message_id, "ui_dump_timeout")
+            else:
+                self._mcp_error(message_id, "ui_dump_failed")
+            return
+        payload = control_actions.list_clickable(xml)
+        result = {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "isError": False,
+        }
+        self._send_json(
+            200, {"jsonrpc": "2.0", "id": message_id, "result": result}
+        )
+
+    def _tap_target(self, device, x, y):
+        """What sits under the proposed point, from a fresh UI dump."""
+        try:
+            xml = adbctl.ui_dump(device["serial"])
+        except adbctl.AdbError:
+            return control_actions.unknown_target()
+        return control_actions.describe_target(xml, x, y)
 
     def _mcp_propose(self, name, params, message_id):
         if not self._control_open():
@@ -1175,6 +1228,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._mcp_error(message_id, str(exc))
                 return
 
+            if action.get("type") == "tap":
+                action["target"] = self._tap_target(
+                    device, action["x"], action["y"]
+                )
+
             info = load_device(self.server.data_dir)
             saved_serial = (info.get("serial") or "").strip()
             try:
@@ -1209,10 +1267,13 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.server.proposal_lock.release()
 
+        target = action.get("target") or {}
         summary = {
             "approval_id": record["id"],
             "state": "pending",
             "action": control_actions.describe(action),
+            "tap_target": target.get("description", ""),
+            "tap_target_clickable": bool(target.get("clickable", False)),
             "reason": action.get("reason", ""),
             "device": device["serial"],
             "width": image.width,
@@ -1241,10 +1302,13 @@ class Handler(BaseHTTPRequestHandler):
         if record is None:
             self._mcp_error(message_id, "unknown_approval")
             return
+        target = record["action"].get("target") or {}
         payload = {
             "id": key,
             "state": record["state"],
             "action": control_actions.describe(record["action"]),
+            "tap_target": target.get("description", ""),
+            "tap_target_clickable": bool(target.get("clickable", False)),
             "reason": record["action"].get("reason", ""),
             "width": record.get("width", 0),
             "height": record.get("height", 0),
@@ -1933,6 +1997,41 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
 
+                # Re-inspect the target immediately before input. An
+                # unreadable dump fails closed; a vanished, changed or newly
+                # covering clickable element refuses execution. Nothing is
+                # retried and no alternative location is ever tapped.
+                proposed_target = record["action"].get("target") or {}
+                try:
+                    xml = adbctl.ui_dump(device["serial"])
+                except adbctl.AdbError:
+                    self.server.approvals.fail(key, "target_unverified")
+                    self._respond(
+                        {"error": "target_unverified"}, 409,
+                        flash="error",
+                    )
+                    return
+                current_target = control_actions.describe_target(xml, x, y)
+                if (
+                    current_target.get("description")
+                    == control_actions.UNKNOWN_TARGET
+                ):
+                    self.server.approvals.fail(key, "target_unverified")
+                    self._respond(
+                        {"error": "target_unverified"}, 409,
+                        flash="error",
+                    )
+                    return
+                if not control_actions.targets_match(
+                    proposed_target, current_target
+                ):
+                    self.server.approvals.fail(key, "target_changed")
+                    self._respond(
+                        {"error": "target_changed"}, 409,
+                        flash="error",
+                    )
+                    return
+
             try:
                 record = self.server.approvals.approve(key)
             except control_actions.ActionError as exc:
@@ -1999,6 +2098,22 @@ class Handler(BaseHTTPRequestHandler):
             % (common, common)
         )
 
+    def _tap_overlay_html(self, x, y, width, height):
+        """Large red circle plus the crosshair, positioned from real pixels."""
+        if width <= 0 or height <= 0:
+            return ""
+        common = (
+            "position:absolute;left:%.4f%%;top:%.4f%%;"
+            "transform:translate(-50%%,-50%%);pointer-events:none"
+        ) % (x * 100.0 / width, y * 100.0 / height)
+        circle = (
+            "<span class='tap-circle' style='%s;width:72px;height:72px;"
+            "border:4px solid #ff0000;border-radius:50%%;"
+            "box-sizing:border-box;background:rgba(255,0,0,0.12)'></span>"
+            % common
+        )
+        return circle + self._crosshair_html(x, y, width, height)
+
     def _result_label(self, record):
         state = record["state"]
         detail = record.get("detail", "")
@@ -2017,6 +2132,10 @@ class Handler(BaseHTTPRequestHandler):
                 return "Failed — Screen changed — ask again."
             if detail == "identity_mismatch":
                 return "Failed — Device identity changed."
+            if detail == "target_changed":
+                return "Failed — Target changed — ask again."
+            if detail == "target_unverified":
+                return "Failed — Could not verify the target."
             return "Failed"
         return state.replace("_", " ").title()
 
@@ -2099,23 +2218,47 @@ class Handler(BaseHTTPRequestHandler):
             if action.get("type") == "tap":
                 x = int(action.get("x", 0))
                 y = int(action.get("y", 0))
+                target = action.get("target") or {}
+                target_text = html.escape(
+                    str(target.get("description") or control_actions.UNKNOWN_TARGET),
+                    quote=True,
+                )
+                headline = (
+                    "<p style='font-size:1.7rem;font-weight:700;"
+                    "line-height:1.3;margin:0 0 .75rem'>"
+                    "This will tap: %s</p>" % target_text
+                )
+                if target.get("clickable"):
+                    warning = "Warning: this will press a button"
+                else:
+                    warning = (
+                        "Warning: no clickable element detected — this area "
+                        "may still contain interactive controls."
+                    )
+                headline += (
+                    "<p style='font-size:1.2rem;font-weight:700;"
+                    "color:#ff2020;margin:0 0 .75rem'>%s</p>" % warning
+                )
                 tap_line = (
                     "<p><b>Proposed action:</b> TAP &middot; "
                     "X=%d, Y=%d</p>" % (x, y)
                 )
-                overlay = self._crosshair_html(x, y, width, height)
+                overlay = self._tap_overlay_html(x, y, width, height)
+            else:
+                headline = "<h3>%s</h3>" % description
             cards.append(
                 "<div style='border:1px solid #555;padding:1rem;"
                 "margin:1rem 0'>"
-                "<h3>%s</h3>%s"
-                "<p><b>AI reason:</b> %s</p>"
-                "<p><b>Screen:</b> %d × %d — %s</p>"
-                "<p>Device: %s &middot; id %s &middot; expires in %s</p>"
-                "<div style='position:relative;display:inline-block;"
+                "%s"
+                "<div style='position:relative;display:block;width:100%%;"
                 "max-width:100%%;line-height:0'>"
                 "<img src='data:image/png;base64,%s' "
-                "style='display:block;max-width:100%%;height:auto;width:auto'>"
+                "style='display:block;width:100%%;max-width:100%%;height:auto'>"
                 "%s</div>"
+                "<p><b>AI reason:</b> %s</p>"
+                "%s"
+                "<p><b>Screen:</b> %d × %d — %s</p>"
+                "<p>Device: %s &middot; id %s &middot; expires in %s</p>"
                 "<form method='post' action='control/approve' "
                 "style='display:inline'>"
                 "<input type='hidden' name='csrf' value='%s'>"
@@ -2128,17 +2271,17 @@ class Handler(BaseHTTPRequestHandler):
                 "<button>Reject</button></form>"
                 "</div>"
                 % (
-                    description,
-                    tap_line,
+                    headline,
+                    image,
+                    overlay,
                     reason,
+                    tap_line,
                     width,
                     height,
                     orientation,
                     device,
                     html.escape(record["id"], quote=True),
                     remaining,
-                    image,
-                    overlay,
                     csrf_attr,
                     html.escape(record["id"], quote=True),
                     csrf_attr,

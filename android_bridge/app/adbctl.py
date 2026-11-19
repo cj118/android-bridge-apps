@@ -20,6 +20,10 @@ PAIR_TIMEOUT = 30.0
 IDENTITY_TIMEOUT = 5.0
 SERVER_TIMEOUT = 10.0
 MAX_OUTPUT_BYTES = 12 * 1024 * 1024
+UI_DUMP_TIMEOUT = 12.0
+UI_DUMP_CLEANUP_TIMEOUT = 5.0
+UI_DUMP_MAX_BYTES = 2 * 1024 * 1024
+UI_DUMP_PATH = "/sdcard/window_dump.xml"
 _SERVER_LOCK = threading.Lock()
 _server_ready = False
 
@@ -364,6 +368,46 @@ def screencap(serial: str, timeout: float = DEFAULT_TIMEOUT):
     if not out:
         raise AdbError("empty capture")
     return out
+
+
+def _remove_ui_dump(serial: str) -> None:
+    """Best-effort removal of the fixed dump file. Never raises."""
+    try:
+        _run(
+            ["-s", serial, "shell", "rm", "-f", UI_DUMP_PATH],
+            timeout=UI_DUMP_CLEANUP_TIMEOUT,
+            max_bytes=4096,
+        )
+    except AdbError:
+        pass
+
+
+def ui_dump(serial: str, timeout: float = UI_DUMP_TIMEOUT):
+    """Fixed uiautomator dump. Read-only; no caller-supplied paths or options.
+
+    The dump file is removed afterwards whether or not the read succeeded, so
+    screen text does not linger on the tablet.
+    """
+    serial = _serial(serial)
+    ensure_server()
+    try:
+        returncode, _out, _err = _run(
+            ["-s", serial, "shell", "uiautomator", "dump", UI_DUMP_PATH],
+            timeout=timeout,
+            max_bytes=8192,
+        )
+        if returncode != 0:
+            raise AdbError("ui dump failed")
+        returncode, out, _err = _run(
+            ["-s", serial, "exec-out", "cat", UI_DUMP_PATH],
+            timeout=timeout,
+            max_bytes=UI_DUMP_MAX_BYTES,
+        )
+        if returncode != 0 or not out:
+            raise AdbError("ui dump failed")
+        return out
+    finally:
+        _remove_ui_dump(serial)
 
 
 def run_input(args, timeout: float = 15.0):

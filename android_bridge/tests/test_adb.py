@@ -257,7 +257,9 @@ class ScreenshotTests(unittest.TestCase):
         status, payload = self.mcp({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual(status, 200)
         names = sorted(tool["name"] for tool in payload["result"]["tools"])
-        self.assertEqual(names, ["android_screenshot", "android_status"])
+        self.assertEqual(
+            names, ["android_screenshot", "android_status", "android_ui_elements"]
+        )
 
     def test_mcp_screenshot_returns_image_content(self):
         status, payload = self.mcp(
@@ -320,7 +322,9 @@ class ScreenshotTests(unittest.TestCase):
             self._restore_allowlist(original)
         self.assertEqual(status, 200)
         names = sorted(t["name"] for t in payload["result"]["tools"])
-        self.assertEqual(names, ["android_screenshot", "android_status"])
+        self.assertEqual(
+            names, ["android_screenshot", "android_status", "android_ui_elements"]
+        )
 
     def test_mcp_rejects_unknown_source_without_token(self):
         original = self._with_allowlist(set())

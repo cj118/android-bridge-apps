@@ -71,6 +71,18 @@ if "-s" in args and "getprop" in args:
     else:
         print(os.environ.get("FAKE_ADB_MODEL", "SM_X210"))
     sys.exit(0)
+if len(args) > 4 and args[2:4] == ["shell", "uiautomator"]:
+    if not os.environ.get("FAKE_ADB_UI_DUMP"):
+        sys.exit(7)
+    print("UI hierchary dumped to: /sdcard/window_dump.xml")
+    sys.exit(0)
+if len(args) > 3 and args[2] == "exec-out" and args[3] == "cat":
+    path = os.environ.get("FAKE_ADB_UI_DUMP")
+    if not path:
+        sys.exit(7)
+    with open(path, "rb") as fh:
+        sys.stdout.buffer.write(fh.read())
+    sys.exit(0)
 if "-s" in args and "exec-out" in args:
     sleep = float(os.environ.get("FAKE_ADB_SCREENCAP_SLEEP", "0") or "0")
     if sleep:
@@ -100,6 +112,55 @@ if len(args) > 4 and args[2:4] == ["shell", "input"] and args[4] in ("tap", "swi
     sys.exit(0)
 sys.exit(7)
 '''
+
+
+UI_DUMP_TAP_TARGET = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="Living Room TV" resource-id="com.x:id/tv"
+          class="android.widget.Button" bounds="[400,700][700,860]"
+          clickable="true" visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
+
+UI_DUMP_TARGET_MOVED = UI_DUMP_TAP_TARGET.replace(
+    "[400,700][700,860]", "[410,700][700,860]"
+)
+UI_DUMP_TARGET_RENAMED = UI_DUMP_TAP_TARGET.replace(
+    "Living Room TV", "Kitchen Light"
+)
+
+UI_DUMP_SECRET = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="hunter2" resource-id="com.x:id/pass"
+          class="android.widget.EditText" password="true"
+          bounds="[400,700][700,860]" clickable="true"
+          visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
+
+UI_DUMP_BLANK = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true" />
+</hierarchy>
+"""
+
+UI_DUMP_ESCAPE = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="&lt;b&gt;&amp;&quot;x&quot;" resource-id=""
+          class="android.widget.Button" bounds="[400,700][700,860]"
+          clickable="true" visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
 
 
 def _png_chunk(kind, payload):
@@ -238,6 +299,11 @@ class ControlSecurityTests(unittest.TestCase):
         os.environ["FAKE_ADB_SCREENCAP_FAIL_AFTER"] = "0"
         os.environ["FAKE_ADB_SCREENCAP_SLEEP"] = "0"
         os.environ["FAKE_ADB_SCREENCAP_COUNTER"] = self.screen_counter
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        # A stable identified target at the default proposal point (540, 780)
+        # keeps the approval path exercised; tests that need an inspection
+        # failure remove it explicitly.
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
         adbctl.reset_server_state()
         with open(self.png_path, "wb") as handle:
             handle.write(self.png)
@@ -349,6 +415,12 @@ class ControlSecurityTests(unittest.TestCase):
         )
         text = payload["result"]["content"][0]["text"]
         return json.loads(text)["approval_id"]
+
+    def set_ui_dump(self, xml):
+        path = os.path.join(self.tmp, "window_dump.xml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(xml)
+        os.environ["FAKE_ADB_UI_DUMP"] = path
 
     def set_screen(self, data):
         with open(self.png_path, "wb") as handle:
@@ -2214,6 +2286,312 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertEqual(
             payload["result"]["content"][0]["text"], "proposal_cooldown"
         )
+
+
+    # ---------- tap target descriptions (0.3.21) ----------
+
+    def test_proposal_reports_the_element_under_the_point(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        self.new_proposal()
+        record = self.server.approvals.pending()[0]
+        target = record["action"]["target"]
+        self.assertEqual(
+            target["description"], 'button "Living Room TV" at [400,700][700,860]'
+        )
+        self.assertEqual(target["bounds"], [400, 700, 700, 860])
+        self.assertTrue(target["clickable"])
+
+    def test_proposal_result_names_the_tap_target(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "target check"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(
+            summary["tap_target"], 'button "Living Room TV" at [400,700][700,860]'
+        )
+        self.assertTrue(summary["tap_target_clickable"])
+
+    def test_dump_failure_is_reported_as_unknown(self):
+        self.start_control()
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        self.new_proposal()
+        record = self.server.approvals.pending()[0]
+        self.assertEqual(
+            record["action"]["target"]["description"],
+            "Unknown — could not check.",
+        )
+        self.assertFalse(record["action"]["target"]["identified"])
+        self.assertFalse(record["action"]["target"]["clickable"])
+
+    def test_blank_area_warns_that_controls_may_still_be_there(self):
+        cookie, _csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_BLANK)
+        self.new_proposal()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn(
+            "This will tap: No clickable element detected — verify visually.",
+            text,
+        )
+        self.assertNotIn("Warning: this will press a button", text)
+        self.assertIn(
+            "Warning: no clickable element detected — this area may still "
+            "contain interactive controls.",
+            text,
+        )
+        self.assertNotIn("No button here", text)
+
+    def test_unknown_target_warns_that_controls_may_still_be_there(self):
+        cookie, _csrf = self.start_control()
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        self.new_proposal()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn("This will tap: Unknown — could not check.", text)
+        self.assertIn(
+            "may still contain interactive controls", text
+        )
+
+    def test_card_order_target_warning_screenshot_reason_buttons(self):
+        cookie, _csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        self.new_proposal()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        markers = (
+            "This will tap:",
+            "Warning: this will press a button",
+            "<img src='data:image/png;base64,",
+            "AI reason:",
+            "<button>Approve</button>",
+            "<button>Reject</button>",
+        )
+        positions = [text.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(
+            positions[0], text.index("Warning: this will press a button")
+        )
+
+    def test_red_circle_is_large_and_centred_on_the_tap(self):
+        cookie, _csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        self.new_proposal()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn("class='tap-circle'", text)
+        self.assertIn("width:72px;height:72px", text)
+        self.assertIn("border:4px solid #ff0000", text)
+        self.assertIn("left:28.1250%;top:65.0000%", text)
+        self.assertIn("width:100%;max-width:100%;height:auto", text)
+
+    def test_target_label_is_escaped_on_card(self):
+        cookie, _csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_ESCAPE)
+        self.new_proposal()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"<b>&\"x\"", page)
+        self.assertIn(b"&lt;b&gt;&amp;&quot;x&quot;", page)
+
+    def test_mcp_ui_elements_needs_viewing(self):
+        self.server.control_active = False
+        self.server.viewing_active = False
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        status, payload = self.propose("android_ui_elements", {})
+        self.assertEqual(status, 403)
+        self.assertEqual(payload, {"error": "viewing_session_closed"})
+
+    def test_mcp_ui_elements_lists_clickable_elements(self):
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 3600
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        status, payload = self.propose("android_ui_elements", {})
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["result"]["isError"])
+        body = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(
+            body["elements"],
+            [
+                {
+                    "name": "Living Room TV",
+                    "bounds": [400, 700, 700, 860],
+                }
+            ],
+        )
+        self.assertEqual(body["count"], 1)
+
+    def test_mcp_ui_elements_reports_dump_failure(self):
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 3600
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        status, payload = self.propose("android_ui_elements", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "ui_dump_failed"
+        )
+
+
+    # ---------- approval-time target recheck (0.3.21 corrections) ----------
+
+    def refuse(self, key, cookie, csrf, detail):
+        status, _, headers = self.ctl(
+            "/control/approve", {"id": key}, cookie, csrf
+        )
+        self.assertEqual(status, 303)
+        self.assertIn("flash=error", headers["Location"])
+        self.assertNotIn("'input'", self.adb_log())
+        record = self.server.approvals.get(key)
+        self.assertEqual(record["state"], "failed")
+        self.assertEqual(record["detail"], detail)
+
+    def test_approval_allows_an_unchanged_target(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("'shell', 'input', 'tap', '540', '780'", self.adb_log())
+        _, polled = self.result(key)
+        self.assertEqual(
+            json.loads(polled["result"]["content"][0]["text"])["state"],
+            "executed",
+        )
+
+    def test_approval_rejects_a_target_that_disappeared(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.set_ui_dump(UI_DUMP_BLANK)
+        self.refuse(key, cookie, csrf, "target_changed")
+
+    def test_approval_rejects_changed_target_bounds(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.set_ui_dump(UI_DUMP_TARGET_MOVED)
+        self.refuse(key, cookie, csrf, "target_changed")
+
+    def test_approval_rejects_a_changed_target_label(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.set_ui_dump(UI_DUMP_TARGET_RENAMED)
+        self.refuse(key, cookie, csrf, "target_changed")
+
+    def test_approval_rejects_a_new_clickable_element(self):
+        cookie, csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_BLANK)
+        key = self.new_proposal()
+        self.assertEqual(
+            self.server.approvals.get(key)["action"]["target"]["description"],
+            "No clickable element detected — verify visually.",
+        )
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        self.refuse(key, cookie, csrf, "target_changed")
+
+    def test_approval_fails_closed_when_inspection_fails(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        self.refuse(key, cookie, csrf, "target_unverified")
+        _, polled = self.result(key)
+        payload = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(payload["state"], "failed")
+
+    def test_approval_fails_closed_on_an_unparseable_dump(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.set_ui_dump("<not a uiautomator dump")
+        self.refuse(key, cookie, csrf, "target_unverified")
+
+    def test_approval_allows_an_unidentified_area_that_stays_unidentified(self):
+        cookie, csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_BLANK)
+        key = self.new_proposal()
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("'shell', 'input', 'tap', '540', '780'", self.adb_log())
+
+    def test_refused_approval_is_never_retried_or_moved(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.set_ui_dump(UI_DUMP_TARGET_MOVED)
+        self.refuse(key, cookie, csrf, "target_changed")
+        self.assertEqual(self.adb_log().count("'input'"), 0)
+        self.assertEqual(
+            self.server.approvals.get(key)["state"], "failed"
+        )
+
+    def test_failed_target_recheck_is_labelled_on_the_panel(self):
+        record = {
+            "state": "failed",
+            "detail": "target_changed",
+            "action": control_actions.validate_tap(1, 1, 10, 10, "x"),
+        }
+        self.assertEqual(
+            bridge.Handler._result_label(None, record),
+            "Failed — Target changed — ask again.",
+        )
+        record["detail"] = "target_unverified"
+        self.assertEqual(
+            bridge.Handler._result_label(None, record),
+            "Failed — Could not verify the target.",
+        )
+
+
+    # ---------- sensitive text and dump hygiene (0.3.21) ----------
+
+    def test_password_contents_never_reach_the_card_or_result(self):
+        cookie, _csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_SECRET)
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "secret check"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertNotIn("hunter2", summary["tap_target"])
+        self.assertIn("com.x:id/pass", summary["tap_target"])
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"hunter2", page)
+        self.assertIn(b"com.x:id/pass", page)
+
+    def test_ui_elements_never_include_password_contents(self):
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 3600
+        self.set_ui_dump(UI_DUMP_SECRET)
+        _, payload = self.propose("android_ui_elements", {})
+        body = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(
+            body["elements"],
+            [{"name": "com.x:id/pass", "bounds": [400, 700, 700, 860]}],
+        )
+        self.assertNotIn("hunter2", str(body))
+
+    def test_ui_dump_file_is_removed_after_proposal(self):
+        self.start_control()
+        self.new_proposal()
+        log = self.adb_log()
+        self.assertIn(
+            "'shell', 'rm', '-f', '/sdcard/window_dump.xml'", log
+        )
+
+    def test_ui_dump_file_is_removed_when_inspection_fails(self):
+        self.start_control()
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        self.new_proposal()
+        log = self.adb_log()
+        self.assertIn(
+            "'shell', 'rm', '-f', '/sdcard/window_dump.xml'", log
+        )
+        self.assertIn("'shell', 'uiautomator', 'dump'", log)
 
 
 if __name__ == "__main__":

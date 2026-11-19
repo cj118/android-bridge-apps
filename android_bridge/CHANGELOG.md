@@ -1,5 +1,47 @@
 # Android Bridge changelog
 
+## 0.3.21
+
+- A tap proposal now runs `uiautomator dump` (fixed command, app user, 12 s
+  timeout) and records the smallest visible **clickable** element at the
+  proposed point: text, content-desc or resource-id cleaned to 80 printable
+  characters plus its bounds. A clickable parent wins over a smaller
+  non-clickable text label, so the card names the control that would actually
+  be pressed. Invisible elements are ignored.
+- An area with no clickable element is never described as empty. It reports
+  "No clickable element detected — verify visually." and the card adds
+  "Warning: no clickable element detected — this area may still contain
+  interactive controls." If the dump fails the description is
+  "Unknown — could not check." with the same warning. UIAutomator is not
+  treated as proof that an unidentified area is safe.
+- The `android_tap` result and `android_action_result` include `tap_target`
+  and `tap_target_clickable`, so the model learns what it was about to press
+  instead of guessing from coordinates.
+- New read-only MCP tool `android_ui_elements` lists visible clickable
+  elements (name and bounds, at most 200, `truncated` flag). It requires
+  Viewing like every other `tools/call`, and is exposed by default alongside
+  `android_screenshot` and `android_status`; `expose_tools` still narrows the
+  list.
+- Approval rechecks the target immediately before input, after the existing
+  fresh-screenshot comparison: it runs UI inspection again and compares the
+  detected target and bounds with the proposal. A missing or changed target,
+  a new clickable element covering the point, or a failed/ambiguous
+  inspection refuses execution (`target_changed` / `target_unverified`) and
+  nothing is retried or tapped elsewhere.
+- Password and text-field contents are never exposed. Nodes with
+  `password="true"` or EditText/password classes contribute only their
+  resource-id to descriptions, the approval card and `android_ui_elements`.
+- The fixed UI dump file is removed after every inspection, including failed
+  ones, so screen text does not linger on the tablet.
+- Approval cards, top to bottom: "This will tap: <element>" in large text,
+  a red warning line (press a button, or unidentified area), the screenshot
+  at full card width with the 72 px red circle and crosshair, the AI reason,
+  then Approve and Reject below the picture. Labels are HTML-escaped.
+- Security behaviour otherwise unchanged: HA-user sign-in, CSRF and Origin
+  checks, the MCP source allowlist, Viewing, hardware serial verification,
+  the fresh-screenshot comparison, single-use approvals, Control expiry, the
+  safety epoch, STOP and `expose_tools`.
+
 ## 0.3.20
 
 - New add-on option `control_minutes` (integer, default 60, allowed 5–240)

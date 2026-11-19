@@ -1,5 +1,5 @@
 name: "Android Bridge (b5)"
-version: "0.3.20"
+version: "0.3.21"
 slug: android_bridge
 description: "Android screen bridge: read-only viewing, approval-gated input"
 arch:
@@ -21,6 +21,7 @@ options:
   expose_tools:
     - android_screenshot
     - android_status
+    - android_ui_elements
   control_minutes: 60
 schema:
   allowed_ha_users:

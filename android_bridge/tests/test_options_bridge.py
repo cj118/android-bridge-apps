@@ -148,7 +148,7 @@ class ToolHandoffTests(unittest.TestCase):
         self.assertEqual(self.read_tools(), {"expose_tools": None})
         self.assertEqual(
             bridge.load_exposed_tools(self.data_dir),
-            ("android_screenshot", "android_status"),
+            ("android_screenshot", "android_status", "android_ui_elements"),
         )
 
     def test_wrong_type_marks_default(self):
@@ -167,7 +167,7 @@ class ToolHandoffTests(unittest.TestCase):
         os.chmod(self.tools, 0o644)
         self.assertEqual(
             bridge.load_exposed_tools(self.data_dir),
-            ("android_screenshot", "android_status"),
+            ("android_screenshot", "android_status", "android_ui_elements"),
         )
 
 
