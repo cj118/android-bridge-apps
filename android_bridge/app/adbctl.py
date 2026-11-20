@@ -24,6 +24,8 @@ UI_DUMP_TIMEOUT = 12.0
 UI_DUMP_CLEANUP_TIMEOUT = 5.0
 UI_DUMP_MAX_BYTES = 2 * 1024 * 1024
 UI_DUMP_PATH = "/sdcard/window_dump.xml"
+FOREGROUND_TIMEOUT = 8.0
+FOREGROUND_MAX_BYTES = 1024 * 1024
 _SERVER_LOCK = threading.Lock()
 _server_ready = False
 
@@ -33,6 +35,21 @@ _CODE_RE = re.compile(r"\A[0-9]{6}\Z")
 _SERIAL_RE = re.compile(r"\A[^\s]{1,128}\Z")
 _TRANSPORT_RE = re.compile(r"\A[A-Za-z0-9.-]{1,253}:[0-9]{1,5}\Z")
 _HARDWARE_SERIAL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_PACKAGE_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+\Z")
+_FOREGROUND_RES = (
+    re.compile(
+        r"mCurrentFocus=Window\{[^}]*?\s"
+        r"([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/"
+    ),
+    re.compile(
+        r"mFocusedApp=.*?\s"
+        r"([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/"
+    ),
+    re.compile(
+        r"mResumedActivity:.*?\s"
+        r"([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/"
+    ),
+)
 _SERIAL_PLACEHOLDERS = frozenset({"unknown", "null", "none", "n/a", "unavailable"})
 
 
@@ -408,6 +425,39 @@ def ui_dump(serial: str, timeout: float = UI_DUMP_TIMEOUT):
         return out
     finally:
         _remove_ui_dump(serial)
+
+
+def parse_foreground_package(output) -> str:
+    """First focused-window package in dumpsys text, or "".
+
+    Only a well-formed package id is returned; nothing else from the dump is
+    kept or logged.
+    """
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    if not isinstance(output, str) or not output:
+        return ""
+    for pattern in _FOREGROUND_RES:
+        match = pattern.search(output)
+        if match is None:
+            continue
+        value = match.group(1)[:128]
+        if _PACKAGE_RE.match(value):
+            return value
+    return ""
+
+
+def foreground_package(serial: str, timeout: float = FOREGROUND_TIMEOUT) -> str:
+    """Read the focused window's package. Fixed, read-only dumpsys command."""
+    ensure_server()
+    returncode, out, _err = _run(
+        ["-s", _serial(serial), "shell", "dumpsys", "window"],
+        timeout=timeout,
+        max_bytes=FOREGROUND_MAX_BYTES,
+    )
+    if returncode != 0:
+        raise AdbError("foreground unavailable")
+    return parse_foreground_package(out)
 
 
 def run_input(args, timeout: float = 15.0):

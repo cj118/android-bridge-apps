@@ -1,5 +1,34 @@
 # Android Bridge changelog
 
+## 0.3.22
+
+- `android_swipe` is now a full approval-gated gesture instead of a bare
+  coordinate pair. It takes `reason` and `purpose` alongside the two points and
+  `duration_ms`, and it is **not exposed by default**: `expose_tools` must name
+  it, exactly like `android_tap` and `android_text`.
+- Every swipe is validated against the screen it was captured from before any
+  approval exists: both points inside the screen and at least 80 px from every
+  edge (`edge_zone`); a distance of at least 100 px and at most 70% of the
+  relevant screen dimension (`distance`); a duration of 300-1500 ms
+  (`duration`); and no more than 20 degrees off the vertical or horizontal axis
+  (`diagonal`). The direction is derived, never supplied: "scroll down (swipe
+  upwards)", "scroll up (swipe downwards)", "swipe left", "swipe right".
+- A swipe proposal records a fresh screenshot, the foreground app's friendly
+  name from its package (for example `com.android.settings` -> "Settings", with
+  a readable fallback for unknown packages) and the clickable element under the
+  start point. The proposal result and `android_action_result` report the
+  direction, app name, purpose and start target.
+- The approval card reads, top to bottom: "DeepSeek wants to <direction> in
+  <app>." then Start, End, the purpose, the screenshot with a green circle at
+  the start, a red circle at the end and an arrow between them, the AI reason,
+  then Approve and Reject.
+- Swipe approval repeats the tap checks: a fresh screenshot of the same size
+  and orientation, an unchanged area around the start point, the same hardware
+  serial, Control ON, single use, 600 s expiry, and STOP cancels. Only then is
+  `input swipe x1 y1 x2 y2 duration` run, followed by a post-action screenshot
+  and the usual `android_action_result` report.
+- Tap, text and every other security behaviour are unchanged.
+
 ## 0.3.21
 
 - A tap proposal now runs `uiautomator dump` (fixed command, app user, 12 s

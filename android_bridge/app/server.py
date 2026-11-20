@@ -954,7 +954,14 @@ class Handler(BaseHTTPRequestHandler):
         },
         {
             "name": "android_swipe",
-            "description": "Propose a swipe. Requires human approval in the bridge Control page.",
+            "description": (
+                "Propose a swipe. It does not execute: a human must approve it "
+                "in the bridge Control page. Both points must be at least 80 px "
+                "from every screen edge, 100 px to 70% of the screen apart and "
+                "within 20 degrees of an axis, over 300-1500 ms. The result names "
+                "the direction, the foreground app and the element under the "
+                "start point. Poll android_action_result afterwards."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -962,9 +969,26 @@ class Handler(BaseHTTPRequestHandler):
                     "y1": {"type": "integer", "minimum": 0, "maximum": 4095},
                     "x2": {"type": "integer", "minimum": 0, "maximum": 4095},
                     "y2": {"type": "integer", "minimum": 0, "maximum": 4095},
-                    "duration_ms": {"type": "integer", "minimum": 50, "maximum": 5000},
+                    "duration_ms": {
+                        "type": "integer",
+                        "minimum": 300,
+                        "maximum": 1500,
+                        "description": "Swipe duration in milliseconds.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": "Human-readable explanation shown on the approval card.",
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": "Plain-English account of what the gesture does.",
+                    },
                 },
-                "required": ["x1", "y1", "x2", "y2"],
+                "required": ["x1", "y1", "x2", "y2", "reason", "purpose"],
                 "additionalProperties": False,
             },
         },
@@ -1176,9 +1200,21 @@ class Handler(BaseHTTPRequestHandler):
             arguments = {}
 
         reason = None
+        purpose = None
         if name == "android_tap":
             try:
                 reason = control_actions.validate_reason(arguments.get("reason"))
+            except control_actions.ActionError as exc:
+                self._mcp_error(message_id, str(exc))
+                return
+        elif name == "android_swipe":
+            try:
+                reason = control_actions.validate_reason(
+                    arguments.get("reason")
+                )
+                purpose = control_actions.validate_purpose(
+                    arguments.get("purpose")
+                )
             except control_actions.ActionError as exc:
                 self._mcp_error(message_id, str(exc))
                 return
@@ -1221,6 +1257,7 @@ class Handler(BaseHTTPRequestHandler):
                         arguments.get("x1"), arguments.get("y1"),
                         arguments.get("x2"), arguments.get("y2"),
                         arguments.get("duration_ms", 300),
+                        image.width, image.height, reason, purpose,
                     )
                 else:
                     action = control_actions.validate_text(arguments.get("text"))
@@ -1231,6 +1268,18 @@ class Handler(BaseHTTPRequestHandler):
             if action.get("type") == "tap":
                 action["target"] = self._tap_target(
                     device, action["x"], action["y"]
+                )
+            elif action.get("type") == "swipe":
+                action["start_target"] = self._tap_target(
+                    device, action["x1"], action["y1"]
+                )
+                try:
+                    package = adbctl.foreground_package(device["serial"])
+                except adbctl.AdbError:
+                    package = ""
+                action["app_package"] = package
+                action["app"] = (
+                    control_actions.app_label(package) or "the current app"
                 )
 
             info = load_device(self.server.data_dir)
@@ -1282,6 +1331,19 @@ class Handler(BaseHTTPRequestHandler):
             "expires_in_seconds": int(control_actions.APPROVAL_TTL_SECONDS),
             "next": "await human approval in the Control page, then call android_action_result",
         }
+        if action.get("type") == "swipe":
+            start_target = action.get("start_target") or {}
+            summary.update(
+                {
+                    "direction": action["direction"],
+                    "app": action["app"],
+                    "app_package": action.get("app_package", ""),
+                    "purpose": action["purpose"],
+                    "distance": action.get("distance", 0),
+                    "start_target": start_target.get("description", ""),
+                    "message": control_actions.swipe_headline(action),
+                }
+            )
         content = [
             {"type": "text", "text": json.dumps(summary)},
             {"type": "image", "data": base64.b64encode(data).decode("ascii"),
@@ -1315,6 +1377,21 @@ class Handler(BaseHTTPRequestHandler):
             "orientation": record.get("orientation", ""),
             "detail": record.get("detail", ""),
         }
+        if record["action"].get("type") == "swipe":
+            start_target = record["action"].get("start_target") or {}
+            payload.update(
+                {
+                    "direction": record["action"].get("direction", ""),
+                    "app": record["action"].get("app", ""),
+                    "app_package": record["action"].get("app_package", ""),
+                    "purpose": record["action"].get("purpose", ""),
+                    "distance": record["action"].get("distance", 0),
+                    "start_target": start_target.get("description", ""),
+                    "message": control_actions.swipe_headline(
+                        record["action"]
+                    ),
+                }
+            )
         content = [{"type": "text", "text": json.dumps(payload)}]
         if record.get("postshot"):
             content.append(
@@ -1925,7 +2002,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond({"error": "device mismatch"}, 409, flash="error")
                 return
 
-            if record["action"].get("type") == "tap":
+            if record["action"].get("type") in ("tap", "swipe"):
                 info = load_device(self.server.data_dir)
                 saved_serial = (info.get("serial") or "").strip()
                 try:
@@ -1982,8 +2059,12 @@ class Handler(BaseHTTPRequestHandler):
                 current_orientation = pngcheck.orientation(
                     after.width, after.height
                 )
-                x = int(record["action"].get("x", -1))
-                y = int(record["action"].get("y", -1))
+                if record["action"].get("type") == "swipe":
+                    x = int(record["action"].get("x1", -1))
+                    y = int(record["action"].get("y1", -1))
+                else:
+                    x = int(record["action"].get("x", -1))
+                    y = int(record["action"].get("y", -1))
                 if (
                     before.width != after.width
                     or before.height != after.height
@@ -2001,7 +2082,10 @@ class Handler(BaseHTTPRequestHandler):
                 # unreadable dump fails closed; a vanished, changed or newly
                 # covering clickable element refuses execution. Nothing is
                 # retried and no alternative location is ever tapped.
-                proposed_target = record["action"].get("target") or {}
+                if record["action"].get("type") == "swipe":
+                    proposed_target = record["action"].get("start_target") or {}
+                else:
+                    proposed_target = record["action"].get("target") or {}
                 try:
                     xml = adbctl.ui_dump(device["serial"])
                 except adbctl.AdbError:
@@ -2162,23 +2246,140 @@ class Handler(BaseHTTPRequestHandler):
             detail_html = (
                 "<p><b>Detail:</b> %s</p>" % detail if detail else ""
             )
+            purpose_html = ""
+            if action.get("purpose"):
+                purpose_html = (
+                    "<p><b>Action:</b> %s</p>"
+                    % html.escape(str(action["purpose"]), quote=True)
+                )
             cards.append(
                 "<div style='border:1px solid #444;padding:.75rem;"
                 "margin:.75rem 0'>"
                 "<h3>%s — %s</h3>"
                 "<p>Device: %s &middot; id %s</p>"
-                "<p><b>AI reason:</b> %s</p>%s%s</div>"
+                "<p><b>AI reason:</b> %s</p>%s%s%s</div>"
                 % (
                     label,
                     description,
                     device,
                     html.escape(record["id"], quote=True),
                     reason,
+                    purpose_html,
                     detail_html,
                     image,
                 )
             )
         return "".join(cards) or "<p>None.</p>"
+
+    def _swipe_overlay_html(self, action, width, height, key):
+        """Green start circle, red end circle and an arrow between them.
+
+        Drawn in the screenshot's own pixel space so the marks stay on the
+        gesture at any card width.
+        """
+        if width <= 0 or height <= 0:
+            return ""
+        try:
+            x1 = int(action.get("x1", 0))
+            y1 = int(action.get("y1", 0))
+            x2 = int(action.get("x2", 0))
+            y2 = int(action.get("y2", 0))
+        except (TypeError, ValueError):
+            return ""
+        token = re.sub(r"[^A-Za-z0-9_-]", "", str(key)) or "x"
+        marker = "swipe-arrow-%s" % token
+        return (
+            "<svg class='swipe-overlay' viewBox='0 0 %d %d' "
+            "style='position:absolute;left:0;top:0;width:100%%;height:100%%;"
+            "pointer-events:none'>"
+            "<defs><marker id='%s' markerWidth='6' markerHeight='6' "
+            "refX='3' refY='3' orient='auto'>"
+            "<path d='M0,0 L6,3 L0,6 z' fill='#ff0000'/></marker></defs>"
+            "<line x1='%d' y1='%d' x2='%d' y2='%d' stroke='#ff0000' "
+            "stroke-width='6' marker-end='url(#%s)'/>"
+            "<circle class='swipe-start' cx='%d' cy='%d' r='26' fill='none' "
+            "stroke='#00c000' stroke-width='6'/>"
+            "<circle class='swipe-end' cx='%d' cy='%d' r='26' fill='none' "
+            "stroke='#ff0000' stroke-width='6'/>"
+            "</svg>"
+            % (
+                width, height,
+                marker,
+                x1, y1, x2, y2, marker,
+                x1, y1,
+                x2, y2,
+            )
+        )
+
+    def _swipe_card_html(self, record, image, remaining, csrf_attr):
+        """Approval card for a swipe, in the documented order.
+
+        Headline sentence, start, end, purpose, the screenshot with the green
+        start circle, red end circle and arrow, the AI reason, then the two
+        decision buttons. Every free-text field is HTML-escaped.
+        """
+        action = record["action"]
+        width = int(record.get("width", 0))
+        height = int(record.get("height", 0))
+        try:
+            x1 = int(action.get("x1", 0))
+            y1 = int(action.get("y1", 0))
+            x2 = int(action.get("x2", 0))
+            y2 = int(action.get("y2", 0))
+        except (TypeError, ValueError):
+            x1 = y1 = x2 = y2 = 0
+        direction = html.escape(
+            str(action.get("direction") or "swipe"), quote=True
+        )
+        app = html.escape(
+            str(action.get("app") or "the current app"), quote=True
+        )
+        purpose = html.escape(
+            str(action.get("purpose", "")), quote=True
+        )
+        reason = html.escape(str(action.get("reason", "")), quote=True)
+        device = html.escape(str(record["device"]), quote=True)
+        record_id = html.escape(record["id"], quote=True)
+        line_style = "font-size:1.25rem;font-weight:600;margin:0 0 .35rem"
+        return (
+            "<div style='border:1px solid #555;padding:1rem;"
+            "margin:1rem 0'>"
+            "<p style='font-size:1.7rem;font-weight:700;line-height:1.3;"
+            "margin:0 0 .75rem'>DeepSeek wants to %s in %s.</p>"
+            "<p style='%s'><b>Start:</b> (%d, %d)</p>"
+            "<p style='%s'><b>End:</b> (%d, %d)</p>"
+            "<p style='%s'><b>Action:</b> %s</p>"
+            "<div style='position:relative;display:block;width:100%%;"
+            "max-width:100%%;line-height:0'>"
+            "<img src='data:image/png;base64,%s' "
+            "style='display:block;width:100%%;max-width:100%%;height:auto'>"
+            "%s</div>"
+            "<p><b>AI reason:</b> %s</p>"
+            "<form method='post' action='control/approve' "
+            "style='display:inline'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<input type='hidden' name='id' value='%s'>"
+            "<button>Approve</button></form> "
+            "<form method='post' action='control/reject' "
+            "style='display:inline'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<input type='hidden' name='id' value='%s'>"
+            "<button>Reject</button></form>"
+            "<p style='margin-top:.5rem;color:#aaa'>%d &times; %d &middot; "
+            "%s &middot; id %s &middot; expires in %s</p></div>"
+            % (
+                direction, app,
+                line_style, x1, y1,
+                line_style, x2, y2,
+                line_style, purpose,
+                image,
+                self._swipe_overlay_html(action, width, height, record["id"]),
+                reason,
+                csrf_attr, record_id,
+                csrf_attr, record_id,
+                width, height, device, record_id, remaining,
+            )
+        )
 
     def _control_page(self, nonce, flash=""):
         session = self.server.ui_sessions.get(nonce) or {}
@@ -2215,6 +2416,11 @@ class Handler(BaseHTTPRequestHandler):
             remaining = control_actions.format_remaining(record["expires"] - now)
             tap_line = ""
             overlay = ""
+            if action.get("type") == "swipe":
+                cards.append(
+                    self._swipe_card_html(record, image, remaining, csrf_attr)
+                )
+                continue
             if action.get("type") == "tap":
                 x = int(action.get("x", 0))
                 y = int(action.get("y", 0))

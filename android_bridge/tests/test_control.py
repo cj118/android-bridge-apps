@@ -71,6 +71,13 @@ if "-s" in args and "getprop" in args:
     else:
         print(os.environ.get("FAKE_ADB_MODEL", "SM_X210"))
     sys.exit(0)
+if len(args) > 4 and args[2:4] == ["shell", "dumpsys"]:
+    print(os.environ.get(
+        "FAKE_ADB_FOREGROUND",
+        "  mCurrentFocus=Window{2f8e1 u0 "
+        "com.android.settings/com.android.settings.Settings}",
+    ))
+    sys.exit(0)
 if len(args) > 4 and args[2:4] == ["shell", "uiautomator"]:
     if not os.environ.get("FAKE_ADB_UI_DUMP"):
         sys.exit(7)
@@ -294,6 +301,10 @@ class ControlSecurityTests(unittest.TestCase):
         os.environ["FAKE_ADB_SERIAL"] = "192.168.1.50:41234"
         os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT12345678"
         os.environ["FAKE_ADB_MODEL"] = "SM_X210"
+        os.environ["FAKE_ADB_FOREGROUND"] = (
+            "  mCurrentFocus=Window{2f8e1 u0 "
+            "com.android.settings/com.android.settings.Settings}"
+        )
         os.environ["FAKE_ADB_SERVER"] = "ok"
         os.environ["FAKE_ADB_SCREENCAP_MODE"] = "ok"
         os.environ["FAKE_ADB_SCREENCAP_FAIL_AFTER"] = "0"
@@ -2211,13 +2222,17 @@ class ControlSecurityTests(unittest.TestCase):
             payload["result"]["content"][0]["text"], "proposal_cooldown"
         )
 
-    def test_swipe_and_text_validation_are_unchanged(self):
-        self.assertEqual(
-            control_actions.validate_swipe(1, 2, 3, 4)["type"], "swipe"
-        )
+    def test_text_validation_is_unchanged(self):
         self.assertEqual(
             control_actions.validate_text("hello")["type"], "text"
         )
+
+    def test_swipe_validation_needs_the_captured_screen(self):
+        action = control_actions.validate_swipe(
+            540, 780, 540, 180, 400, 1920, 1200, "scroll", "scroll a list"
+        )
+        self.assertEqual(action["type"], "swipe")
+        self.assertEqual(action["direction"], "scroll down (swipe upwards)")
 
 
     def test_stop_during_proposal_is_refused(self):
@@ -2592,6 +2607,261 @@ class ControlSecurityTests(unittest.TestCase):
             "'shell', 'rm', '-f', '/sdcard/window_dump.xml'", log
         )
         self.assertIn("'shell', 'uiautomator', 'dump'", log)
+
+    # ---------- swipe (0.3.22) ----------
+
+    SWIPE_PURPOSE = "scroll down one screen"
+
+    def swipe_proposal(self, **overrides):
+        arguments = {
+            "x1": 540, "y1": 780, "x2": 540, "y2": 180,
+            "duration_ms": 400,
+            "reason": "scroll the list to reach the next item",
+            "purpose": self.SWIPE_PURPOSE,
+        }
+        arguments.update(overrides)
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        return self.propose("android_swipe", arguments)
+
+    def swipe_key(self, **overrides):
+        _, payload = self.swipe_proposal(**overrides)
+        self.assertFalse(payload["result"]["isError"], payload)
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        return summary["approval_id"]
+
+    def test_swipe_proposal_records_direction_app_and_purpose(self):
+        self.start_control()
+        _, payload = self.swipe_proposal()
+        self.assertFalse(payload["result"]["isError"], payload)
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["state"], "pending")
+        self.assertEqual(summary["action"], "Swipe (540, 780) to (540, 180) over 400 ms")
+        self.assertEqual(summary["direction"], "scroll down (swipe upwards)")
+        self.assertEqual(summary["app"], "Settings")
+        self.assertEqual(summary["app_package"], "com.android.settings")
+        self.assertEqual(summary["purpose"], self.SWIPE_PURPOSE)
+        self.assertEqual(
+            summary["start_target"],
+            'button "Living Room TV" at [400,700][700,860]',
+        )
+        self.assertEqual(
+            summary["message"],
+            "DeepSeek wants to scroll down (swipe upwards) in Settings.",
+        )
+        self.assertEqual(payload["result"]["content"][1]["type"], "image")
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_swipe_proposal_requires_reason_and_purpose(self):
+        self.start_control()
+        for overrides in ({"reason": ""}, {"purpose": "  "}, {"purpose": None}):
+            with self.subTest(overrides=overrides):
+                _, payload = self.swipe_proposal(**overrides)
+                self.assertTrue(payload["result"]["isError"], payload)
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_swipe_unknown_app_falls_back_to_the_current_app(self):
+        self.start_control()
+        os.environ["FAKE_ADB_FOREGROUND"] = "no focused window here"
+        _, payload = self.swipe_proposal()
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["app"], "the current app")
+        self.assertEqual(
+            summary["message"],
+            "DeepSeek wants to scroll down (swipe upwards) "
+            "in the current app.",
+        )
+
+    def test_swipe_edge_zone_is_refused(self):
+        self.start_control()
+        cases = (
+            {"x1": 40},
+            {"x2": 40},
+            {"y1": 1180},
+            {"y2": 40},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                _, payload = self.swipe_proposal(**overrides)
+                self.assertTrue(payload["result"]["isError"], payload)
+                self.assertIn(
+                    "edge_zone", payload["result"]["content"][0]["text"]
+                )
+        self.assertEqual(self.server.approvals.pending(), [])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_swipe_distance_too_short_and_too_long_are_refused(self):
+        self.start_control()
+        cases = (
+            ({"y2": 720}, "distance"),
+            ({"y1": 1100, "y2": 100}, "distance"),
+        )
+        for overrides, token in cases:
+            with self.subTest(overrides=overrides):
+                _, payload = self.swipe_proposal(**overrides)
+                self.assertTrue(payload["result"]["isError"], payload)
+                self.assertIn(token, payload["result"]["content"][0]["text"])
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_swipe_duration_out_of_range_is_refused(self):
+        self.start_control()
+        for value in (299, 1501, "fast"):
+            with self.subTest(duration=value):
+                _, payload = self.swipe_proposal(duration_ms=value)
+                self.assertTrue(payload["result"]["isError"], payload)
+                self.assertIn(
+                    "duration", payload["result"]["content"][0]["text"]
+                )
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_swipe_duration_limits_are_inclusive(self):
+        self.start_control()
+        for value in (300, 1500):
+            with self.subTest(duration=value):
+                self.server.approvals.clear()
+                _, payload = self.swipe_proposal(duration_ms=value)
+                self.assertFalse(payload["result"]["isError"], payload)
+
+    def test_swipe_diagonal_is_refused(self):
+        self.start_control()
+        _, payload = self.swipe_proposal(x2=900, y2=420)
+        self.assertTrue(payload["result"]["isError"], payload)
+        self.assertIn("diagonal", payload["result"]["content"][0]["text"])
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_swipe_within_twenty_degrees_is_accepted(self):
+        self.start_control()
+        # 600 px vertical with a 200 px horizontal drift: about 18.4 degrees.
+        _, payload = self.swipe_proposal(x2=740, y2=180)
+        self.assertFalse(payload["result"]["isError"], payload)
+
+    def test_swipe_direction_wording_for_all_four_directions(self):
+        cases = (
+            ((540, 900, 540, 300), "scroll down (swipe upwards)"),
+            ((540, 300, 540, 900), "scroll up (swipe downwards)"),
+            ((900, 600, 300, 600), "swipe left"),
+            ((300, 600, 900, 600), "swipe right"),
+        )
+        for points, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    control_actions.swipe_direction(*points), expected
+                )
+
+    def test_swipe_card_message_order_and_wording(self):
+        cookie, _csrf = self.start_control()
+        self.swipe_key()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        rendered = RenderedPage()
+        rendered.feed(page.decode("utf-8"))
+        body = rendered.visible_text
+        self.assertIn(
+            "DeepSeek wants to scroll down (swipe upwards) in Settings.", body
+        )
+        self.assertIn("Start: (540, 780)", body)
+        self.assertIn("End: (540, 180)", body)
+        self.assertIn("Action: " + self.SWIPE_PURPOSE, body)
+        headline = body.index("DeepSeek wants to")
+        start = body.index("Start: (540, 780)")
+        end = body.index("End: (540, 180)")
+        action = body.index("Action: " + self.SWIPE_PURPOSE)
+        reason = body.index("AI reason:")
+        approve = body.index("Approve")
+        self.assertLess(headline, start)
+        self.assertLess(start, end)
+        self.assertLess(end, action)
+        self.assertLess(action, reason)
+        self.assertLess(reason, approve)
+        self.assertIsNotNone(re.search(r"expires in \d+m \d\ds", body))
+
+    def test_swipe_card_draws_green_start_red_end_and_arrow(self):
+        cookie, _csrf = self.start_control()
+        self.swipe_key()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        body = page.decode("utf-8")
+        self.assertIn("class='swipe-start'", body)
+        self.assertIn("class='swipe-end'", body)
+        self.assertIn("stroke='#00c000'", body)
+        self.assertIn("<line x1='540' y1='780' x2='540' y2='180'", body)
+        self.assertIn("marker-end='url(#swipe-arrow-", body)
+        self.assertIn("<path d='M0,0 L6,3 L0,6 z' fill='#ff0000'/>", body)
+        start = body.index("class='swipe-start'")
+        end = body.index("class='swipe-end'")
+        self.assertLess(body.index("<line "), start)
+        self.assertLess(start, end)
+
+    def test_swipe_approve_executes_and_returns_postshot(self):
+        cookie, csrf = self.start_control()
+        key = self.swipe_key()
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn(
+            "'shell', 'input', 'swipe', '540', '780', '540', '180', '400'",
+            self.adb_log(),
+        )
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["state"], "executed")
+        self.assertEqual(state["direction"], "scroll down (swipe upwards)")
+        self.assertEqual(state["app"], "Settings")
+        self.assertEqual(state["purpose"], self.SWIPE_PURPOSE)
+        self.assertEqual(polled["result"]["content"][1]["type"], "image")
+
+    def test_swipe_is_single_use(self):
+        cookie, csrf = self.start_control()
+        key = self.swipe_key()
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(self.adb_log().count("'swipe'"), 1)
+
+    def test_swipe_refuses_when_the_screen_changed(self):
+        cookie, csrf = self.start_control()
+        key = self.swipe_key()
+        self.set_screen(
+            make_png(blocks=((470, 730, 610, 830, 10, 200, 10, 255),))
+        )
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'swipe'", self.adb_log())
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["state"], "failed")
+        self.assertEqual(state["detail"], "screen_changed")
+
+    def test_swipe_stop_cancels_the_pending_approval(self):
+        cookie, csrf = self.start_control()
+        key = self.swipe_key()
+        status, _, _ = self.ctl("/control/stop", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIsNone(self.server.approvals.get(key))
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'swipe'", self.adb_log())
+
+    def test_bearer_cannot_approve_a_swipe(self):
+        self.start_control()
+        key = self.swipe_key()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key}, self.bearer()
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(
+            self.server.approvals.get(key)["state"], "pending"
+        )
+        self.assertNotIn("'swipe'", self.adb_log())
+
+    def test_swipe_is_not_exposed_by_default(self):
+        self.assertNotIn("android_swipe", bridge.DEFAULT_EXPOSED_TOOLS)
+        empty = tempfile.mkdtemp(prefix="bridge-empty-", dir=self.tmp)
+        self.assertNotIn(
+            "android_swipe", bridge.load_exposed_tools(empty)
+        )
+        config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
+        with open(config_path, encoding="utf-8") as handle:
+            self.assertNotIn("android_swipe", handle.read())
+
 
 
 if __name__ == "__main__":

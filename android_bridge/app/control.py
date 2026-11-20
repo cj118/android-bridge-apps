@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import secrets
 import threading
@@ -15,10 +16,20 @@ import time
 import xml.etree.ElementTree as ElementTree
 
 MAX_COORD = 4095
-MAX_SWIPE_MS = 5000
-MIN_SWIPE_MS = 50
 MAX_TEXT_LEN = 200
 MAX_REASON_LEN = 200
+MAX_PURPOSE_LEN = 200
+
+# Swipe limits (0.3.22). Edge gestures belong to the system (back, home, the
+# notification shade), so both points stay clear of every edge; the gesture
+# must be long enough to register, short enough to stay deliberate, and close
+# enough to one axis to mean what its direction says.
+MIN_SWIPE_MS = 300
+MAX_SWIPE_MS = 1500
+SWIPE_EDGE_ZONE = 80
+SWIPE_MIN_DISTANCE = 100
+SWIPE_MAX_DISTANCE_FRACTION = 0.70
+SWIPE_MAX_ANGLE_DEGREES = 20
 # 10 minutes: long enough to read the screenshot calmly without leaving an
 # approval usable for an unbounded time.
 APPROVAL_TTL_SECONDS = 600.0
@@ -81,21 +92,166 @@ def validate_tap(x, y, width, height, reason):
     }
 
 
-def validate_swipe(x1, y1, x2, y2, duration_ms=300):
+def validate_purpose(purpose):
+    """Accept a non-empty plain-English account of what the gesture does."""
+    if not isinstance(purpose, str):
+        raise ActionError("purpose is required")
+    if not purpose.strip():
+        raise ActionError("purpose is required")
+    if len(purpose) > MAX_PURPOSE_LEN:
+        raise ActionError("purpose is too long")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in purpose):
+        raise ActionError("purpose contains unsupported characters")
+    return purpose
+
+
+def swipe_direction(x1, y1, x2, y2):
+    """The plain-English effect of the gesture on the screen.
+
+    A finger moving up scrolls the content down, and vice versa; a finger
+    moving left is a swipe left. Vertical wins when the gesture is closer to
+    vertical than horizontal.
+    """
+    dx = x2 - x1
+    dy = y2 - y1
+    if abs(dy) >= abs(dx):
+        if dy < 0:
+            return "scroll down (swipe upwards)"
+        if dy > 0:
+            return "scroll up (swipe downwards)"
+    else:
+        if dx < 0:
+            return "swipe left"
+        if dx > 0:
+            return "swipe right"
+    raise ActionError("distance: a swipe must move")
+
+
+def _near_edge(value, limit):
+    return value < SWIPE_EDGE_ZONE or value > limit - 1 - SWIPE_EDGE_ZONE
+
+
+def _swipe_distance(x1, y1, x2, y2, width, height):
+    """Distance and axis rules: 100 px to 70% of the relevant dimension."""
+    dx = x2 - x1
+    dy = y2 - y1
+    distance = math.hypot(dx, dy)
+    if distance < SWIPE_MIN_DISTANCE:
+        raise ActionError("distance: a swipe must travel at least 100 px")
+    if abs(dx) >= abs(dy):
+        limit = width * SWIPE_MAX_DISTANCE_FRACTION
+        off_axis = abs(dy)
+        axis = abs(dx)
+    else:
+        limit = height * SWIPE_MAX_DISTANCE_FRACTION
+        off_axis = abs(dx)
+        axis = abs(dy)
+    if distance > limit:
+        raise ActionError("distance: a swipe may not exceed 70% of the screen")
+    angle = math.degrees(math.atan2(off_axis, axis)) if axis > 0 else 90.0
+    if angle > SWIPE_MAX_ANGLE_DEGREES:
+        raise ActionError(
+            "diagonal: a swipe must stay within 20 degrees of an axis"
+        )
+    return distance
+
+
+def validate_swipe(x1, y1, x2, y2, duration_ms, width, height, reason, purpose):
+    """Validate a swipe against the screen it was captured from.
+
+    Every rule is checked here, before any approval exists: points inside the
+    screen and clear of the edge band, a whole-number duration in range, a
+    distance between 100 px and 70% of the axis dimension, and at most 20
+    degrees off that axis. The direction is derived, never supplied.
+    """
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+        raise ActionError("invalid screen width")
+    if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
+        raise ActionError("invalid screen height")
+    x1 = _coord(x1, width)
+    y1 = _coord(y1, height)
+    x2 = _coord(x2, width)
+    y2 = _coord(y2, height)
+    if isinstance(duration_ms, bool):
+        raise ActionError("duration: a swipe must last 300 to 1500 ms")
     try:
         duration = int(duration_ms)
     except (TypeError, ValueError):
-        raise ActionError("invalid duration") from None
+        raise ActionError(
+            "duration: a swipe must last 300 to 1500 ms"
+        ) from None
     if not MIN_SWIPE_MS <= duration <= MAX_SWIPE_MS:
-        raise ActionError("duration out of range")
+        raise ActionError("duration: a swipe must last 300 to 1500 ms")
+    if (
+        _near_edge(x1, width) or _near_edge(x2, width)
+        or _near_edge(y1, height) or _near_edge(y2, height)
+    ):
+        raise ActionError(
+            "edge_zone: keep both points at least 80 px from every screen edge"
+        )
+    distance = _swipe_distance(x1, y1, x2, y2, width, height)
     return {
         "type": "swipe",
-        "x1": _coord(x1),
-        "y1": _coord(y1),
-        "x2": _coord(x2),
-        "y2": _coord(y2),
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
         "duration_ms": duration,
+        "distance": int(round(distance)),
+        "direction": swipe_direction(x1, y1, x2, y2),
+        "reason": validate_reason(reason),
+        "purpose": validate_purpose(purpose),
     }
+
+
+# Friendly names for packages the tablet is likely to show. Anything else
+# falls back to a readable form of the package's last segment, so the card
+# never invents a product name it does not know.
+APP_LABELS = {
+    "com.android.settings": "Settings",
+    "com.android.systemui": "System UI",
+    "com.android.chrome": "Chrome",
+    "com.android.vending": "Play Store",
+    "com.google.android.youtube": "YouTube",
+    "com.google.android.gm": "Gmail",
+    "com.google.android.apps.maps": "Maps",
+    "com.google.android.apps.photos": "Photos",
+    "com.google.android.camera": "Camera",
+    "com.android.camera": "Camera",
+    "com.google.android.dialer": "Phone",
+    "com.android.dialer": "Phone",
+    "com.google.android.apps.messaging": "Messages",
+    "com.android.messaging": "Messages",
+    "com.google.android.calendar": "Calendar",
+    "com.android.deskclock": "Clock",
+    "com.android.documentsui": "Files",
+}
+_APP_FALLBACK_MAX = 40
+
+
+def app_label(package):
+    """Friendly app name from a package id (com.android.settings -> Settings)."""
+    if not isinstance(package, str):
+        return ""
+    value = package.strip()
+    if not value:
+        return ""
+    known = APP_LABELS.get(value)
+    if known:
+        return known
+    segment = value.rsplit(".", 1)[-1]
+    words = re.sub(r"[^A-Za-z0-9]+", " ", segment).split()
+    if not words:
+        return ""
+    label = " ".join(word[:1].upper() + word[1:] for word in words)
+    return label[:_APP_FALLBACK_MAX]
+
+
+def swipe_headline(action):
+    """The exact approval-card sentence for a swipe proposal."""
+    direction = action.get("direction") or "swipe"
+    app = action.get("app") or "the current app"
+    return "DeepSeek wants to %s in %s." % (direction, app)
 
 
 def validate_text(text):
