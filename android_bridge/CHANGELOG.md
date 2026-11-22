@@ -1,5 +1,28 @@
 # Android Bridge changelog
 
+## 0.3.24
+
+- New read-only `GET /pending_summary`, reachable only from Home Assistant
+  Core. The socket peer address is compared with Core's address on the hassio
+  network (`homeassistant`, resolved at runtime and cached for 30 s, with
+  `172.30.32.1` as the documented fallback). `X-Forwarded-For` and every other
+  forwarding header are ignored. Any other peer - the OpenCode add-on, the
+  Supervisor ingress proxy, a LAN address - gets `403 {"error":
+  "forbidden"}`. No session, CSRF token or bearer token is accepted or
+  required.
+- The response is JSON only: `{"pending": <count>, "headline": "<headline of
+  the oldest pending approval or empty>", "oldest_id": "<id or empty>"}`. The
+  headline is the one the approval card already shows: `This will tap: button
+  "..."` (bounds stripped), `DeepSeek wants to <direction> in <app>.` or
+  `DeepSeek wants to type in <app>.`. Typed text, coordinates, screenshots,
+  serials, tokens and any id other than `oldest_id` are never included.
+- The endpoint only reads the in-memory approval list. It cannot approve,
+  reject, expire or alter anything, never captures a screenshot and never runs
+  ADB. Approving or rejecting still happens only on the Home Assistant user
+  control page.
+- Existing approval, tap, swipe, text, STOP and security behaviour is
+  unchanged.
+
 ## 0.3.23
 
 - `android_text` is now a real approval-gated action instead of a schema stub.

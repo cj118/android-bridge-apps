@@ -1,5 +1,5 @@
 name: "Android Bridge (b5)"
-version: "0.3.23"
+version: "0.3.24"
 slug: android_bridge
 description: "Android screen bridge: read-only viewing, approval-gated input"
 arch:

@@ -29,7 +29,7 @@ import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.23"
+VERSION = "0.3.24"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -56,6 +56,15 @@ MCP_ALLOWED_HOSTS = (
     "f5588468-ha-opencode-beta",
 )
 MCP_ALLOWLIST_TTL_SECONDS = 30.0
+
+# Home Assistant Core reaches this add-on at "homeassistant" on the hassio
+# network. Only that peer may read /pending_summary; 172.30.32.1 is the
+# documented fallback when the name does not resolve. Forwarding headers are
+# never consulted.
+CORE_ALLOWED_HOSTS = ("homeassistant",)
+CORE_ALLOWED_FALLBACK_IPS = frozenset({"172.30.32.1"})
+CORE_ALLOWLIST_TTL_SECONDS = 30.0
+_CORE_ALLOWLIST = {"ips": frozenset(), "at": 0.0}
 UI_SESSION_TTL_SECONDS = 8 * 3600
 CONTROL_MINUTES_DEFAULT = options_bridge.CONTROL_MINUTES_DEFAULT
 CONTROL_MINUTES_MIN = options_bridge.CONTROL_MINUTES_MIN
@@ -134,6 +143,28 @@ def refresh_mcp_allowlist(force=False):
 
 def mcp_source_allowed(address):
     return address in refresh_mcp_allowlist()
+
+
+def refresh_core_allowlist(force=False):
+    """Addresses Home Assistant Core may use to reach this add-on."""
+    now = time.monotonic()
+    if (
+        not force
+        and _CORE_ALLOWLIST["ips"]
+        and now - _CORE_ALLOWLIST["at"] < CORE_ALLOWLIST_TTL_SECONDS
+    ):
+        return _CORE_ALLOWLIST["ips"]
+    ips = set(CORE_ALLOWED_FALLBACK_IPS)
+    for host in CORE_ALLOWED_HOSTS:
+        ips |= _resolve_host_ips(host)
+    _CORE_ALLOWLIST["ips"] = frozenset(ip for ip in ips if ip)
+    _CORE_ALLOWLIST["at"] = now
+    return _CORE_ALLOWLIST["ips"]
+
+
+def core_peer_allowed(address):
+    """True only for Home Assistant Core's own network address."""
+    return bool(address) and address in refresh_core_allowlist()
 
 _TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{32,128}\Z")
 _LOGGABLE_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -779,6 +810,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
 
+        if path == "/pending_summary":
+            self._pending_summary()
+            return
+
         if path == "/control":
             nonce = self._ui_session()
             if not nonce:
@@ -827,6 +862,34 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self._send_json(404, {"error": "not_found"})
+
+    def _pending_summary(self):
+        """Read-only approval summary, readable by Home Assistant Core only.
+
+        The peer address comes from the socket itself; X-Forwarded-For and
+        friends are ignored. Nothing here approves, rejects, captures, expires
+        or executes anything, and ADB is never contacted.
+        """
+        if not core_peer_allowed(self._peer()):
+            self._send_json(403, {"error": "forbidden"})
+            return
+        pending = self.server.approvals.pending()
+        if not pending:
+            self._send_json(
+                200, {"pending": 0, "headline": "", "oldest_id": ""}
+            )
+            return
+        oldest = min(pending, key=lambda record: record["created"])
+        self._send_json(
+            200,
+            {
+                "pending": len(pending),
+                "headline": control_actions.approval_headline(
+                    oldest["action"]
+                ),
+                "oldest_id": oldest["id"],
+            },
+        )
 
     _ERROR_STATUS = {
         "capture_busy": 429,

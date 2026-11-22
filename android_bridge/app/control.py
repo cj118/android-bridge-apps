@@ -285,6 +285,29 @@ def text_headline(action):
     return "DeepSeek wants to type in %s" % app
 
 
+def approval_headline(action):
+    """The approval card's headline, safe for a read-only summary.
+
+    The tap card names the element together with its bounds; the summary drops
+    the bounds because it must never carry coordinates. Typed text, screenshots
+    and device identifiers are not part of any headline.
+    """
+    kind = action.get("type")
+    if kind == "swipe":
+        return swipe_headline(action)
+    if kind == "text":
+        return text_headline(action) + "."
+    if kind == "tap":
+        target = action.get("target") or {}
+        if target.get("identified"):
+            label = target.get("label") or ""
+            detail = 'button "%s"' % label if label else "tappable area"
+        else:
+            detail = target.get("description") or UNKNOWN_TARGET
+        return "This will tap: %s" % detail
+    return "An approval is waiting."
+
+
 def validate_text(text, purpose=None, reason=None):
     """Restricted ordinary text, at most 200 characters.
 

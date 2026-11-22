@@ -3368,8 +3368,148 @@ class ControlSecurityTests(unittest.TestCase):
     def test_text_version_is_bumped(self):
         config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
         with open(config_path, encoding="utf-8") as handle:
-            self.assertIn('version: "0.3.23"', handle.read())
-        self.assertEqual(bridge.VERSION, "0.3.23")
+            self.assertIn('version: "0.3.24"', handle.read())
+        self.assertEqual(bridge.VERSION, "0.3.24")
+
+
+    # ---------- pending summary (0.3.24) ----------
+
+    CORE_PEER = "172.30.32.1"
+
+    def summary(self, headers=None):
+        status, body, response_headers = self.req(
+            "GET", "/pending_summary", headers
+        )
+        return status, json.loads(body), body, response_headers
+
+    def test_pending_summary_is_open_to_core_with_nothing_pending(self):
+        self.set_peer(self.CORE_PEER)
+        status, data, _body, headers = self.summary()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            data, {"pending": 0, "headline": "", "oldest_id": ""}
+        )
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_pending_summary_forbids_every_other_peer(self):
+        for peer in (
+            "172.30.32.2",   # Supervisor ingress
+            "172.30.32.9",   # another add-on (for example OpenCode)
+            "172.30.33.4",   # unknown hassio peer
+            "192.168.18.20", # LAN
+            "127.0.0.1",
+        ):
+            with self.subTest(peer=peer):
+                self.set_peer(peer)
+                status, data, _body, _headers = self.summary()
+                self.assertEqual(status, 403)
+                self.assertEqual(data, {"error": "forbidden"})
+
+    def test_pending_summary_ignores_forwarding_headers(self):
+        self.set_peer("172.30.33.4")
+        status, data, _body, _headers = self.summary(
+            {
+                "X-Forwarded-For": self.CORE_PEER,
+                "X-Real-IP": self.CORE_PEER,
+                "Forwarded": "for=" + self.CORE_PEER,
+            }
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(data, {"error": "forbidden"})
+
+        self.set_peer(self.CORE_PEER)
+        status, data, _body, _headers = self.summary(
+            {"X-Forwarded-For": "192.168.18.20"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["pending"], 0)
+
+    def test_pending_summary_tap_headline_has_no_coordinates(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        key = self.new_proposal()
+        self.set_peer(self.CORE_PEER)
+        status, data, _body, _headers = self.summary()
+        self.assertEqual(status, 200)
+        self.assertEqual(data["pending"], 1)
+        self.assertEqual(data["oldest_id"], key)
+        self.assertEqual(
+            data["headline"], 'This will tap: button "Living Room TV"'
+        )
+        self.assertNotIn("[", data["headline"])
+        self.assertNotIn("540", data["headline"])
+
+    def test_pending_summary_swipe_headline(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        key = self.swipe_key()
+        self.set_peer(self.CORE_PEER)
+        status, data, _body, _headers = self.summary()
+        self.assertEqual(status, 200)
+        self.assertEqual(data["pending"], 1)
+        self.assertEqual(data["oldest_id"], key)
+        self.assertEqual(
+            data["headline"],
+            "DeepSeek wants to scroll down (swipe upwards) in Settings.",
+        )
+        self.assertNotIn("540, 780", data["headline"])
+
+    def test_pending_summary_text_headline_has_no_typed_text(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        key = self.text_key()
+        self.set_peer(self.CORE_PEER)
+        status, data, body, _headers = self.summary()
+        self.assertEqual(status, 200)
+        self.assertEqual(data["pending"], 1)
+        self.assertEqual(data["oldest_id"], key)
+        self.assertEqual(
+            data["headline"], "DeepSeek wants to type in Settings."
+        )
+        self.assertEqual(
+            sorted(data), ["headline", "oldest_id", "pending"]
+        )
+        raw = body.decode("utf-8")
+        self.assertNotIn(self.TEXT_PHRASE, raw)
+        self.assertNotIn("192.168.1.50", raw)
+        self.assertNotIn(self.token, raw)
+
+    def test_pending_summary_counts_all_types_and_names_the_oldest(self):
+        self.start_control()
+        self.server.first_tap_test = False
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        tap_key = self.new_proposal()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        self.swipe_key()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        self.text_key()
+        self.set_peer(self.CORE_PEER)
+        status, data, body, _headers = self.summary()
+        self.assertEqual(status, 200)
+        self.assertEqual(data["pending"], 3)
+        self.assertEqual(data["oldest_id"], tap_key)
+        self.assertEqual(
+            data["headline"], 'This will tap: button "Living Room TV"'
+        )
+        raw = body.decode("utf-8")
+        self.assertNotIn(self.TEXT_PHRASE, raw)
+        self.assertNotIn("192.168.1.50", raw)
+        self.assertNotIn(self.token, raw)
+
+    def test_pending_summary_never_runs_adb_or_changes_state(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        key = self.new_proposal()
+        before = self.adb_log()
+        self.set_peer(self.CORE_PEER)
+        for _ in range(3):
+            status, _data, _body, _headers = self.summary()
+            self.assertEqual(status, 200)
+        self.assertEqual(self.adb_log(), before)
+        self.assertEqual(
+            self.server.approvals.get(key)["state"], "pending"
+        )
+        self.assertNotIn("'input'", self.adb_log())
 
 
 if __name__ == "__main__":
