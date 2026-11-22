@@ -1,5 +1,17 @@
 # Android Bridge changelog
 
+## 0.3.25
+
+- Friendly app names for the approval-card headline: `com.android.settings.intelligence`
+  now reads "Settings search", `io.homeassistant.companion.android` reads
+  "Home Assistant", `com.sec.android.app.launcher` reads "Home screen" and
+  `com.samsung.android.app.routines` reads "Modes and Routines".
+  `com.android.settings` stays "Settings" and `com.android.chrome` stays
+  "Chrome". Unknown packages keep the existing readable fallback: the last
+  package segment with each word capitalised.
+- Presentation only. Approval, security, tap, swipe, text and notification
+  behaviour is unchanged.
+
 ## 0.3.24
 
 - New read-only `GET /pending_summary`, reachable only from Home Assistant

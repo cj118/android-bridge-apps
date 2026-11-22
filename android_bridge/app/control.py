@@ -234,6 +234,7 @@ def validate_swipe(x1, y1, x2, y2, duration_ms, width, height, reason, purpose):
 # never invents a product name it does not know.
 APP_LABELS = {
     "com.android.settings": "Settings",
+    "com.android.settings.intelligence": "Settings search",
     "com.android.systemui": "System UI",
     "com.android.chrome": "Chrome",
     "com.android.vending": "Play Store",
@@ -250,6 +251,9 @@ APP_LABELS = {
     "com.google.android.calendar": "Calendar",
     "com.android.deskclock": "Clock",
     "com.android.documentsui": "Files",
+    "io.homeassistant.companion.android": "Home Assistant",
+    "com.sec.android.app.launcher": "Home screen",
+    "com.samsung.android.app.routines": "Modes and Routines",
 }
 _APP_FALLBACK_MAX = 40
 

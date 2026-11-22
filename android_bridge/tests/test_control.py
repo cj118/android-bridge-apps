@@ -3368,8 +3368,52 @@ class ControlSecurityTests(unittest.TestCase):
     def test_text_version_is_bumped(self):
         config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
         with open(config_path, encoding="utf-8") as handle:
-            self.assertIn('version: "0.3.24"', handle.read())
-        self.assertEqual(bridge.VERSION, "0.3.24")
+            self.assertIn('version: "0.3.25"', handle.read())
+        self.assertEqual(bridge.VERSION, "0.3.25")
+
+    # ---------- app labels (0.3.25) ----------
+
+    APP_LABEL_CASES = {
+        "com.android.settings.intelligence": "Settings search",
+        "com.android.settings": "Settings",
+        "io.homeassistant.companion.android": "Home Assistant",
+        "com.android.chrome": "Chrome",
+        "com.sec.android.app.launcher": "Home screen",
+        "com.samsung.android.app.routines": "Modes and Routines",
+    }
+
+    def test_app_label_known_packages(self):
+        for package, label in self.APP_LABEL_CASES.items():
+            with self.subTest(package=package):
+                self.assertEqual(
+                    control_actions.app_label(package), label
+                )
+
+    def test_app_label_unknown_package_keeps_readable_fallback(self):
+        self.assertEqual(
+            control_actions.app_label("com.example.someapp"), "Someapp"
+        )
+        self.assertEqual(
+            control_actions.app_label("com.example.some_app"), "Some App"
+        )
+        self.assertEqual(control_actions.app_label(""), "")
+        self.assertEqual(control_actions.app_label(None), "")
+
+    def test_text_headline_names_settings_search(self):
+        action = {
+            "type": "text",
+            "app": control_actions.app_label(
+                "com.android.settings.intelligence"
+            ),
+        }
+        self.assertEqual(
+            control_actions.approval_headline(action),
+            "DeepSeek wants to type in Settings search.",
+        )
+        self.assertEqual(
+            control_actions.text_headline(action),
+            "DeepSeek wants to type in Settings search",
+        )
 
 
     # ---------- pending summary (0.3.24) ----------

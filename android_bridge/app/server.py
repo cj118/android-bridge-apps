@@ -29,7 +29,7 @@ import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.24"
+VERSION = "0.3.25"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
