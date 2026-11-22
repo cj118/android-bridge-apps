@@ -1,5 +1,60 @@
 # Android Bridge changelog
 
+## 0.3.23
+
+- `android_text` is now a real approval-gated action instead of a schema stub.
+  It takes `text`, `purpose` and `reason`, and it is **still not exposed by
+  default**: `expose_tools` must name it, exactly like `android_tap` and
+  `android_swipe`. The shipped `config.yaml` default lists only the read-only
+  tools.
+- Text is restricted before any approval exists: 1-200 characters from
+  letters, digits, spaces and `.,!@_+:-`, trimmed at both ends. Anything
+  else - shell metacharacters, quotes, newlines, non-ASCII - is refused with
+  `text contains unsupported characters`. The card, the stored action and the
+  input command always carry the same trimmed string.
+- A proposal records a fresh screenshot, the foreground package (friendly name
+  as for swipes) and the **one** visible, focused, editable field from
+  `uiautomator dump`. It is refused when nothing editable is focused
+  (`no_focused_text_field`), when several fields are focused at once
+  (`ambiguous_text_field`), when the dump fails (`target_unverified`), when the
+  foreground app cannot be read or reports no package at all
+  (`foreground_unavailable`, and no pending record is created) and for every
+  password, PIN, one-time-code, payment-card, account or API-secret field
+  (`sensitive_field_refused`). Secret detection reads only metadata - the
+  `password` attribute, the class, and whole words in `resource-id`,
+  `content-desc` and `hint` - never the field's contents.
+- A field's name on the card is its `content-desc`, then its `resource-id`.
+  The field's own `text` is never used, so a previous query or an address
+  already in the box is not shown to a model.
+- The approval card reads: "DeepSeek wants to type in <app>", the destination
+  field, the complete text in a space-preserving block with its character
+  count, the purpose, the AI reason, the screenshot with the field outlined in
+  green, then Approve and Reject. Every value is HTML-escaped.
+- Approving repeats the tap and swipe checks and adds two of its own: the same
+  hardware serial, the same app package still in front, the same single field
+  still focused with identical bounds and name, a fresh screenshot of the same
+  size and orientation with the **field's whole rectangle** unchanged, Control
+  ON, STOP not pressed, 600 s expiry and single use. Refusals are reported as
+  `app_changed`, `target_changed`, `sensitive_field`, `target_unverified` or
+  `screen_changed`. An empty or unreadable package on either side of the app
+  comparison is `app_changed`, never a skipped check. Nothing is retried and no
+  alternative field is ever used.
+- Execution runs the fixed argv `adb -s SERIAL shell input text TEXT`, with
+  the text re-validated just before use, spaces encoded as `%s` and the text
+  passed as one argument. `adb shell` still hands the command to the device
+  shell, which is exactly why the character set is restricted: `#` (comment),
+  `?` and `*` (globs), quotes, `;`, `|`, `&`, `$`, backticks, parentheses,
+  backslashes and newlines are refused. There is no clipboard path. A
+  post-action screenshot is captured and returned through the usual
+  `android_action_result` payload, which also reports the app, field, purpose
+  and character count - never the typed text.
+- Text stays out of logs: descriptions report only a character count, stderr
+  never contains the phrase, and the error strings are fixed tokens.
+- New tests cover validation, wrong-field refusal, sensitive-field refusal,
+  approval, rejection, STOP, expiry, replay, app change, screen change and
+  typing failure, plus pure-function tests for field selection. Tap and swipe
+  behaviour is unchanged.
+
 ## 0.3.22
 
 - `android_swipe` is now a full approval-gated gesture instead of a bare

@@ -29,7 +29,7 @@ import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.21"
+VERSION = "0.3.23"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -994,11 +994,46 @@ class Handler(BaseHTTPRequestHandler):
         },
         {
             "name": "android_text",
-            "description": "Propose typing text. Requires human approval in the bridge Control page.",
+            "description": (
+                "Propose typing into the one focused text field. It does not "
+                "execute: a human must approve it in the bridge Control page. "
+                "A proposal is refused unless exactly one visible, focused, "
+                "ordinary editable field is found; password, PIN, payment and "
+                "other secret fields are refused. Text is limited to letters, "
+                "digits, spaces and .,!@_+:- up to 200 characters. Poll "
+                "android_action_result afterwards."
+            ),
             "inputSchema": {
                 "type": "object",
-                "properties": {"text": {"type": "string", "maxLength": 200}},
-                "required": ["text"],
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": (
+                            "Exact text to enter; shown in full on the "
+                            "approval card."
+                        ),
+                    },
+                    "purpose": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": (
+                            "Plain-English account of what the typing does."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "description": (
+                            "Human-readable explanation shown on the "
+                            "approval card."
+                        ),
+                    },
+                },
+                "required": ["text", "purpose", "reason"],
                 "additionalProperties": False,
             },
         },
@@ -1218,6 +1253,17 @@ class Handler(BaseHTTPRequestHandler):
             except control_actions.ActionError as exc:
                 self._mcp_error(message_id, str(exc))
                 return
+        elif name == "android_text":
+            try:
+                reason = control_actions.validate_reason(
+                    arguments.get("reason")
+                )
+                purpose = control_actions.validate_purpose(
+                    arguments.get("purpose")
+                )
+            except control_actions.ActionError as exc:
+                self._mcp_error(message_id, str(exc))
+                return
 
         if not self.server.proposal_lock.acquire(blocking=False):
             self._mcp_error(message_id, "proposal_busy")
@@ -1260,7 +1306,9 @@ class Handler(BaseHTTPRequestHandler):
                         image.width, image.height, reason, purpose,
                     )
                 else:
-                    action = control_actions.validate_text(arguments.get("text"))
+                    action = control_actions.validate_text(
+                        arguments.get("text"), purpose, reason
+                    )
             except control_actions.ActionError as exc:
                 self._mcp_error(message_id, str(exc))
                 return
@@ -1281,6 +1329,37 @@ class Handler(BaseHTTPRequestHandler):
                 action["app"] = (
                     control_actions.app_label(package) or "the current app"
                 )
+            elif action.get("type") == "text":
+                # Typing needs two facts a tap does not: which app is in front
+                # and which single field has focus. Both are read fresh, and a
+                # failure refuses the proposal instead of guessing.
+                try:
+                    package = adbctl.foreground_package(device["serial"])
+                except adbctl.AdbError:
+                    self._mcp_error(message_id, "foreground_unavailable")
+                    return
+                if not package:
+                    # No readable package means the app cannot be verified at
+                    # approval either, so no record is created.
+                    self._mcp_error(message_id, "foreground_unavailable")
+                    return
+                action["app_package"] = package
+                action["app"] = (
+                    control_actions.app_label(package) or "the current app"
+                )
+                try:
+                    xml = adbctl.ui_dump(device["serial"])
+                except adbctl.AdbError:
+                    self._mcp_error(message_id, "target_unverified")
+                    return
+                field = control_actions.focused_text_field(xml)
+                if not field.get("identified"):
+                    self._mcp_error(
+                        message_id,
+                        field.get("reason") or "target_unverified",
+                    )
+                    return
+                action["field"] = field
 
             info = load_device(self.server.data_dir)
             saved_serial = (info.get("serial") or "").strip()
@@ -1344,6 +1423,19 @@ class Handler(BaseHTTPRequestHandler):
                     "message": control_actions.swipe_headline(action),
                 }
             )
+        elif action.get("type") == "text":
+            field = action.get("field") or {}
+            summary.update(
+                {
+                    "text": action["text"],
+                    "app": action["app"],
+                    "app_package": action.get("app_package", ""),
+                    "purpose": action["purpose"],
+                    "field": field.get("description", ""),
+                    "field_label": field.get("label", ""),
+                    "message": control_actions.text_headline(action),
+                }
+            )
         content = [
             {"type": "text", "text": json.dumps(summary)},
             {"type": "image", "data": base64.b64encode(data).decode("ascii"),
@@ -1388,6 +1480,21 @@ class Handler(BaseHTTPRequestHandler):
                     "distance": record["action"].get("distance", 0),
                     "start_target": start_target.get("description", ""),
                     "message": control_actions.swipe_headline(
+                        record["action"]
+                    ),
+                }
+            )
+        elif record["action"].get("type") == "text":
+            field = record["action"].get("field") or {}
+            payload.update(
+                {
+                    "text_length": len(record["action"].get("text", "")),
+                    "app": record["action"].get("app", ""),
+                    "app_package": record["action"].get("app_package", ""),
+                    "purpose": record["action"].get("purpose", ""),
+                    "field": field.get("description", ""),
+                    "field_label": field.get("label", ""),
+                    "message": control_actions.text_headline(
                         record["action"]
                     ),
                 }
@@ -2002,7 +2109,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond({"error": "device mismatch"}, 409, flash="error")
                 return
 
-            if record["action"].get("type") in ("tap", "swipe"):
+            if record["action"].get("type") in ("tap", "swipe", "text"):
                 info = load_device(self.server.data_dir)
                 saved_serial = (info.get("serial") or "").strip()
                 try:
@@ -2059,17 +2166,46 @@ class Handler(BaseHTTPRequestHandler):
                 current_orientation = pngcheck.orientation(
                     after.width, after.height
                 )
-                if record["action"].get("type") == "swipe":
+                action_type = record["action"].get("type")
+                region_radius = None
+                if action_type == "swipe":
                     x = int(record["action"].get("x1", -1))
                     y = int(record["action"].get("y1", -1))
+                elif action_type == "text":
+                    # The field's whole rectangle is what typing changes, so
+                    # "unchanged" is proved across that area rather than at a
+                    # single point.
+                    bounds = (
+                        record["action"].get("field") or {}
+                    ).get("bounds") or []
+                    try:
+                        x1, y1, x2, y2 = (int(value) for value in bounds)
+                        x = (x1 + x2) // 2
+                        y = (y1 + y2) // 2
+                        region_radius = max(x2 - x1, y2 - y1) // 2
+                    except (TypeError, ValueError):
+                        self.server.approvals.fail(key, "target_unverified")
+                        self._respond(
+                            {"error": "target_unverified"}, 409,
+                            flash="error",
+                        )
+                        return
                 else:
                     x = int(record["action"].get("x", -1))
                     y = int(record["action"].get("y", -1))
+                if region_radius is None:
+                    screen_changed = pngcheck.region_changed(
+                        before, after, x, y
+                    )
+                else:
+                    screen_changed = pngcheck.region_changed(
+                        before, after, x, y, radius=region_radius
+                    )
                 if (
                     before.width != after.width
                     or before.height != after.height
                     or original_orientation != current_orientation
-                    or pngcheck.region_changed(before, after, x, y)
+                    or screen_changed
                 ):
                     self.server.approvals.fail(key, "screen_changed")
                     self._respond(
@@ -2080,41 +2216,102 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Re-inspect the target immediately before input. An
                 # unreadable dump fails closed; a vanished, changed or newly
-                # covering clickable element refuses execution. Nothing is
-                # retried and no alternative location is ever tapped.
-                if record["action"].get("type") == "swipe":
-                    proposed_target = record["action"].get("start_target") or {}
+                # covering control refuses execution. Nothing is retried and
+                # no alternative target is ever used.
+                if action_type == "text":
+                    # Typing also proves the same app is in front and the same
+                    # single field still holds focus. A pixel that merely
+                    # looks right is not enough for text.
+                    try:
+                        current_package = adbctl.foreground_package(
+                            device["serial"]
+                        )
+                    except adbctl.AdbError:
+                        self.server.approvals.fail(key, "target_unverified")
+                        self._respond(
+                            {"error": "target_unverified"}, 409,
+                            flash="error",
+                        )
+                        return
+                    expected_package = record["action"].get(
+                        "app_package", ""
+                    )
+                    if (
+                        not expected_package
+                        or not current_package
+                        or current_package != expected_package
+                    ):
+                        self.server.approvals.fail(key, "app_changed")
+                        self._respond(
+                            {"error": "app_changed"}, 409, flash="error"
+                        )
+                        return
+                    try:
+                        xml = adbctl.ui_dump(device["serial"])
+                    except adbctl.AdbError:
+                        self.server.approvals.fail(key, "target_unverified")
+                        self._respond(
+                            {"error": "target_unverified"}, 409,
+                            flash="error",
+                        )
+                        return
+                    current_field = control_actions.focused_text_field(xml)
+                    if not current_field.get("identified"):
+                        if current_field.get("sensitive"):
+                            detail = "sensitive_field"
+                        else:
+                            detail = "target_changed"
+                        self.server.approvals.fail(key, detail)
+                        self._respond(
+                            {"error": detail}, 409, flash="error"
+                        )
+                        return
+                    proposed_field = record["action"].get("field") or {}
+                    if not control_actions.text_targets_match(
+                        proposed_field, current_field
+                    ):
+                        self.server.approvals.fail(key, "target_changed")
+                        self._respond(
+                            {"error": "target_changed"}, 409,
+                            flash="error",
+                        )
+                        return
                 else:
-                    proposed_target = record["action"].get("target") or {}
-                try:
-                    xml = adbctl.ui_dump(device["serial"])
-                except adbctl.AdbError:
-                    self.server.approvals.fail(key, "target_unverified")
-                    self._respond(
-                        {"error": "target_unverified"}, 409,
-                        flash="error",
-                    )
-                    return
-                current_target = control_actions.describe_target(xml, x, y)
-                if (
-                    current_target.get("description")
-                    == control_actions.UNKNOWN_TARGET
-                ):
-                    self.server.approvals.fail(key, "target_unverified")
-                    self._respond(
-                        {"error": "target_unverified"}, 409,
-                        flash="error",
-                    )
-                    return
-                if not control_actions.targets_match(
-                    proposed_target, current_target
-                ):
-                    self.server.approvals.fail(key, "target_changed")
-                    self._respond(
-                        {"error": "target_changed"}, 409,
-                        flash="error",
-                    )
-                    return
+                    if record["action"].get("type") == "swipe":
+                        proposed_target = (
+                            record["action"].get("start_target") or {}
+                        )
+                    else:
+                        proposed_target = record["action"].get("target") or {}
+                    try:
+                        xml = adbctl.ui_dump(device["serial"])
+                    except adbctl.AdbError:
+                        self.server.approvals.fail(key, "target_unverified")
+                        self._respond(
+                            {"error": "target_unverified"}, 409,
+                            flash="error",
+                        )
+                        return
+                    current_target = control_actions.describe_target(xml, x, y)
+                    if (
+                        current_target.get("description")
+                        == control_actions.UNKNOWN_TARGET
+                    ):
+                        self.server.approvals.fail(key, "target_unverified")
+                        self._respond(
+                            {"error": "target_unverified"}, 409,
+                            flash="error",
+                        )
+                        return
+                    if not control_actions.targets_match(
+                        proposed_target, current_target
+                    ):
+                        self.server.approvals.fail(key, "target_changed")
+                        self._respond(
+                            {"error": "target_changed"}, 409,
+                            flash="error",
+                        )
+                        return
 
             try:
                 record = self.server.approvals.approve(key)
@@ -2220,6 +2417,10 @@ class Handler(BaseHTTPRequestHandler):
                 return "Failed — Target changed — ask again."
             if detail == "target_unverified":
                 return "Failed — Could not verify the target."
+            if detail == "app_changed":
+                return "Failed — App changed — ask again."
+            if detail == "sensitive_field":
+                return "Failed — Sensitive field — typing refused."
             return "Failed"
         return state.replace("_", " ").title()
 
@@ -2381,6 +2582,97 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
 
+    def _field_overlay_html(self, field, width, height):
+        """Rectangle over the destination field, in the screenshot's pixels."""
+        if width <= 0 or height <= 0:
+            return ""
+        bounds = (field or {}).get("bounds") or []
+        if not isinstance(bounds, list) or len(bounds) != 4:
+            return ""
+        try:
+            x1, y1, x2, y2 = (int(value) for value in bounds)
+        except (TypeError, ValueError):
+            return ""
+        left = x1 * 100.0 / width
+        top = y1 * 100.0 / height
+        span_x = max(0.0, (x2 - x1) * 100.0 / width)
+        span_y = max(0.0, (y2 - y1) * 100.0 / height)
+        return (
+            "<span style='position:absolute;left:%.4f%%;top:%.4f%%;"
+            "width:%.4f%%;height:%.4f%%;border:4px solid #00c000;"
+            "box-sizing:border-box;background:rgba(0,192,0,0.15);"
+            "pointer-events:none'></span>"
+        ) % (left, top, span_x, span_y)
+
+    def _text_card_html(self, record, image, remaining, csrf_attr):
+        """Approval card for typing, in the documented order.
+
+        Headline, destination field, the complete text, purpose, AI reason,
+        the screenshot with the field outlined, then Approve and Reject.
+        Every free-text value is HTML-escaped; the text is shown in a block
+        that preserves spaces so what is approved is exactly what is typed.
+        """
+        action = record["action"]
+        width = int(record.get("width", 0))
+        height = int(record.get("height", 0))
+        field = action.get("field") or {}
+        app = html.escape(
+            str(action.get("app") or "the current app"), quote=True
+        )
+        field_text = html.escape(
+            str(field.get("description") or control_actions.NOTE_NO_FIELD),
+            quote=True,
+        )
+        text_value = html.escape(str(action.get("text", "")), quote=True)
+        purpose = html.escape(str(action.get("purpose", "")), quote=True)
+        reason = html.escape(str(action.get("reason", "")), quote=True)
+        device = html.escape(str(record["device"]), quote=True)
+        record_id = html.escape(record["id"], quote=True)
+        line_style = "font-size:1.25rem;font-weight:600;margin:0 0 .35rem"
+        return (
+            "<div style='border:1px solid #555;padding:1rem;"
+            "margin:1rem 0'>"
+            "<p style='font-size:1.7rem;font-weight:700;line-height:1.3;"
+            "margin:0 0 .75rem'>%s</p>"
+            "<p style='%s'><b>Destination field:</b> %s</p>"
+            "<p style='%s'><b>Text to enter (%d characters):</b></p>"
+            "<pre style='white-space:pre-wrap;word-break:break-word;"
+            "background:#111;color:#fff;border:1px solid #555;padding:.75rem;"
+            "font-size:1.15rem;margin:0 0 .75rem'>%s</pre>"
+            "<p style='%s'><b>Purpose:</b> %s</p>"
+            "<p><b>AI reason:</b> %s</p>"
+            "<div style='position:relative;display:block;width:100%%;"
+            "max-width:100%%;line-height:0'>"
+            "<img src='data:image/png;base64,%s' "
+            "style='display:block;width:100%%;max-width:100%%;height:auto'>"
+            "%s</div>"
+            "<form method='post' action='control/approve' "
+            "style='display:inline'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<input type='hidden' name='id' value='%s'>"
+            "<button>Approve</button></form> "
+            "<form method='post' action='control/reject' "
+            "style='display:inline'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<input type='hidden' name='id' value='%s'>"
+            "<button>Reject</button></form>"
+            "<p style='margin-top:.5rem;color:#aaa'>%d &times; %d &middot; "
+            "%s &middot; id %s &middot; expires in %s</p></div>"
+            % (
+                control_actions.text_headline(action),
+                line_style, field_text,
+                line_style, len(action.get("text", "")),
+                text_value,
+                line_style, purpose,
+                reason,
+                image,
+                self._field_overlay_html(field, width, height),
+                csrf_attr, record_id,
+                csrf_attr, record_id,
+                width, height, device, record_id, remaining,
+            )
+        )
+
     def _control_page(self, nonce, flash=""):
         session = self.server.ui_sessions.get(nonce) or {}
         csrf = session.get("csrf", "")
@@ -2419,6 +2711,11 @@ class Handler(BaseHTTPRequestHandler):
             if action.get("type") == "swipe":
                 cards.append(
                     self._swipe_card_html(record, image, remaining, csrf_attr)
+                )
+                continue
+            if action.get("type") == "text":
+                cards.append(
+                    self._text_card_html(record, image, remaining, csrf_attr)
                 )
                 continue
             if action.get("type") == "tap":

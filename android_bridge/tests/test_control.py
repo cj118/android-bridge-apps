@@ -116,6 +116,8 @@ if "-s" in args and "exec-out" in args:
         sys.stdout.buffer.write(fh.read())
     sys.exit(0)
 if len(args) > 4 and args[2:4] == ["shell", "input"] and args[4] in ("tap", "swipe", "text"):
+    if os.environ.get("FAKE_ADB_INPUT_FAIL"):
+        sys.exit(1)
     sys.exit(0)
 sys.exit(7)
 '''
@@ -147,6 +149,77 @@ UI_DUMP_SECRET = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
           class="android.widget.EditText" password="true"
           bounds="[400,700][700,860]" clickable="true"
           visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
+
+UI_DUMP_TEXT_FIELD = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="Search settings"
+          resource-id="com.android.settings:id/search_src_text"
+          class="android.widget.EditText" bounds="[400,700][1500,860]"
+          focused="true" clickable="true" visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
+
+UI_DUMP_TEXT_FIELD_MOVED = UI_DUMP_TEXT_FIELD.replace(
+    "[400,700][1500,860]", "[400,720][1500,880]"
+)
+UI_DUMP_TEXT_FIELD_BLURRED = UI_DUMP_TEXT_FIELD.replace(
+    'focused="true"', 'focused="false"'
+)
+UI_DUMP_TEXT_FIELD_HIDDEN = UI_DUMP_TEXT_FIELD.replace(
+    'visible-to-user="true"', 'visible-to-user="false"'
+)
+
+UI_DUMP_PASSWORD_FIELD = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="hunter2" resource-id="com.android.settings:id/password"
+          class="android.widget.EditText" password="true"
+          bounds="[400,700][1500,860]" focused="true" clickable="true"
+          visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
+
+UI_DUMP_PIN_FIELD = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="1234" resource-id="com.android.settings:id/pin_entry"
+          class="android.widget.EditText" bounds="[400,700][1500,860]"
+          focused="true" clickable="true" visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
+
+UI_DUMP_CARD_FIELD = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="4111 1111 1111 1111"
+          resource-id="com.android.settings:id/card_number"
+          class="android.widget.EditText" bounds="[400,700][1500,860]"
+          focused="true" clickable="true" visible-to-user="true" />
+  </node>
+</hierarchy>
+"""
+
+UI_DUMP_TWO_FIELDS = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout"
+        bounds="[0,0][1920,1200]" clickable="false" visible-to-user="true">
+    <node index="0" text="" resource-id="com.android.settings:id/first"
+          class="android.widget.EditText" bounds="[400,700][900,860]"
+          focused="true" clickable="true" visible-to-user="true" />
+    <node index="1" text="" resource-id="com.android.settings:id/second"
+          class="android.widget.EditText" bounds="[1000,700][1500,860]"
+          focused="true" clickable="true" visible-to-user="true" />
   </node>
 </hierarchy>
 """
@@ -311,6 +384,7 @@ class ControlSecurityTests(unittest.TestCase):
         os.environ["FAKE_ADB_SCREENCAP_SLEEP"] = "0"
         os.environ["FAKE_ADB_SCREENCAP_COUNTER"] = self.screen_counter
         os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        os.environ.pop("FAKE_ADB_INPUT_FAIL", None)
         # A stable identified target at the default proposal point (540, 780)
         # keeps the approval path exercised; tests that need an inspection
         # failure remove it explicitly.
@@ -2862,6 +2936,440 @@ class ControlSecurityTests(unittest.TestCase):
         with open(config_path, encoding="utf-8") as handle:
             self.assertNotIn("android_swipe", handle.read())
 
+
+
+
+    # ---------- typed text (0.3.23) ----------
+
+    TEXT_PHRASE = "hello world"
+    TEXT_PURPOSE = "type a harmless phrase into the settings search box"
+    TEXT_REASON = "checking that approved typing reaches only the search field"
+
+    def text_proposal(self, **overrides):
+        arguments = {
+            "text": self.TEXT_PHRASE,
+            "purpose": self.TEXT_PURPOSE,
+            "reason": self.TEXT_REASON,
+        }
+        arguments.update(overrides)
+        self.server.last_proposal_at = 0.0
+        self.server.capture_times.clear()
+        return self.propose("android_text", arguments)
+
+    def text_key(self, **overrides):
+        _, payload = self.text_proposal(**overrides)
+        self.assertFalse(payload["result"]["isError"], payload)
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        return summary["approval_id"]
+
+    def text_ready(self):
+        cookie, csrf = self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        return cookie, csrf
+
+    def test_text_proposal_records_app_field_and_message(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        _, payload = self.text_proposal()
+        self.assertFalse(payload["result"]["isError"], payload)
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["state"], "pending")
+        self.assertEqual(summary["action"], "Type 11 characters")
+        self.assertEqual(summary["text"], self.TEXT_PHRASE)
+        self.assertEqual(summary["app"], "Settings")
+        self.assertEqual(summary["app_package"], "com.android.settings")
+        self.assertEqual(summary["purpose"], self.TEXT_PURPOSE)
+        self.assertEqual(
+            summary["field"],
+            'text field "com.android.settings:id/search_src_text" '
+            "at [400,700][1500,860]",
+        )
+        self.assertEqual(
+            summary["message"], "DeepSeek wants to type in Settings"
+        )
+        self.assertEqual(payload["result"]["content"][1]["type"], "image")
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_text_proposal_requires_purpose_and_reason(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        cases = (
+            {"purpose": ""},
+            {"purpose": "  "},
+            {"purpose": None},
+            {"reason": " "},
+            {"reason": None},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                _, payload = self.text_proposal(**overrides)
+                self.assertTrue(payload["result"]["isError"], payload)
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_text_rejects_unsupported_characters_and_length(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        for value in (
+            "hello; rm -rf /",
+            "$(id)",
+            "a|b",
+            "back\\slash",
+            "quote\"mark",
+            "line\nbreak",
+            "caf\u00e9",
+            "x" * 201,
+            "   ",
+            "",
+            "issue #42",
+            "what?",
+        ):
+            with self.subTest(value=value[:20]):
+                _, payload = self.text_proposal(text=value)
+                self.assertTrue(payload["result"]["isError"], payload)
+        self.assertEqual(self.server.approvals.pending(), [])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_text_limits_are_inclusive(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        phrase = "a" * 200
+        _, payload = self.text_proposal(text=phrase)
+        self.assertFalse(payload["result"]["isError"], payload)
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["text"], phrase)
+
+    def test_text_is_trimmed_before_approval(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        _, payload = self.text_proposal(text="  hello world  ")
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["text"], "hello world")
+
+    def test_text_refuses_without_a_focused_field(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TAP_TARGET)
+        _, payload = self.text_proposal()
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "no_focused_text_field"
+        )
+        self.assertEqual(self.server.approvals.pending(), [])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_text_refuses_an_unfocused_or_hidden_field(self):
+        self.start_control()
+        for xml in (UI_DUMP_TEXT_FIELD_BLURRED, UI_DUMP_TEXT_FIELD_HIDDEN):
+            with self.subTest(xml=xml[:60]):
+                self.set_ui_dump(xml)
+                _, payload = self.text_proposal()
+                self.assertTrue(payload["result"]["isError"], payload)
+                self.assertEqual(
+                    payload["result"]["content"][0]["text"],
+                    "no_focused_text_field",
+                )
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_text_refuses_two_focused_fields(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TWO_FIELDS)
+        _, payload = self.text_proposal()
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "ambiguous_text_field"
+        )
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_text_refuses_a_failed_inspection(self):
+        self.start_control()
+        os.environ.pop("FAKE_ADB_UI_DUMP", None)
+        _, payload = self.text_proposal()
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "target_unverified"
+        )
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_text_refuses_password_pin_and_card_fields(self):
+        self.start_control()
+        for xml, secret in (
+            (UI_DUMP_PASSWORD_FIELD, "hunter2"),
+            (UI_DUMP_PIN_FIELD, "1234"),
+            (UI_DUMP_CARD_FIELD, "4111 1111 1111 1111"),
+        ):
+            with self.subTest(secret=secret):
+                self.set_ui_dump(xml)
+                _, payload = self.text_proposal()
+                body = str(payload)
+                self.assertTrue(payload["result"]["isError"], payload)
+                self.assertEqual(
+                    payload["result"]["content"][0]["text"],
+                    "sensitive_field_refused",
+                )
+                self.assertNotIn(secret, body)
+        self.assertEqual(self.server.approvals.pending(), [])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_text_card_shows_complete_text_field_purpose_and_reason(self):
+        cookie, _csrf = self.text_ready()
+        self.text_key()
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn("DeepSeek wants to type in Settings", text)
+        self.assertIn("Destination field:", text)
+        self.assertIn(
+            "com.android.settings:id/search_src_text", text
+        )
+        self.assertIn("Text to enter (11 characters):", text)
+        self.assertIn(">hello world<", text)
+        self.assertIn(self.TEXT_PURPOSE, text)
+        self.assertIn(self.TEXT_REASON, text)
+        self.assertIn("border:4px solid #00c000", text)
+        self.assertIn("Approve", text)
+        self.assertIn("Reject", text)
+        self.assertNotIn("Search settings", text)
+
+    def test_text_card_order_is_documented(self):
+        cookie, _csrf = self.text_ready()
+        self.text_key()
+        status, page, _ = self.req("GET", "/control", cookie)
+        text = page.decode("utf-8")
+        order = [
+            "DeepSeek wants to type in Settings",
+            "Destination field:",
+            "Text to enter",
+            "Purpose:",
+            "AI reason:",
+            "border:4px solid #00c000",
+            "Approve",
+            "Reject",
+        ]
+        positions = [text.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_text_card_escapes_purpose_and_reason(self):
+        cookie, _csrf = self.text_ready()
+        self.text_key(
+            purpose="<script>alert(1)</script>",
+            reason="<b>bold</b>",
+        )
+        status, page, _ = self.req("GET", "/control", cookie)
+        text = page.decode("utf-8")
+        self.assertNotIn("<script>alert(1)</script>", text)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", text)
+        self.assertNotIn("<b>bold</b>", text)
+
+    def test_text_approve_executes_fixed_input_and_returns_postshot(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn(
+            "'shell', 'input', 'text', 'hello%sworld'", self.adb_log()
+        )
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["state"], "executed")
+        self.assertEqual(state["text_length"], len(self.TEXT_PHRASE))
+        self.assertNotIn("text", state)
+        self.assertNotIn(self.TEXT_PHRASE, json.dumps(state))
+        self.assertEqual(state["purpose"], self.TEXT_PURPOSE)
+        self.assertEqual(state["app"], "Settings")
+        self.assertIn("search_src_text", state["field"])
+        self.assertEqual(polled["result"]["content"][1]["type"], "image")
+
+    def test_text_reject_never_types(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        status, _, _ = self.ctl("/control/reject", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'text'", self.adb_log())
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["state"], "rejected")
+
+    def test_text_stop_cancels_the_pending_approval(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        status, _, _ = self.ctl("/control/stop", {}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIsNone(self.server.approvals.get(key))
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'text'", self.adb_log())
+
+    def test_text_expiry_refuses_execution(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        record = self.server.approvals.get(key)
+        record["expires"] = time.monotonic() - 1
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'text'", self.adb_log())
+
+    def test_text_approval_is_single_use(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(self.adb_log().count("'text'"), 1)
+
+    def test_text_refuses_a_changed_field_at_approval(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD_MOVED)
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'text'", self.adb_log())
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["state"], "failed")
+        self.assertEqual(state["detail"], "target_changed")
+
+    def test_text_refuses_a_field_that_lost_focus(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD_BLURRED)
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertNotIn("'text'", self.adb_log())
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["detail"], "target_changed")
+
+    def test_text_refuses_a_field_that_became_sensitive(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        self.set_ui_dump(UI_DUMP_PASSWORD_FIELD)
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertNotIn("'text'", self.adb_log())
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["detail"], "sensitive_field")
+
+    def test_text_refuses_a_changed_app_at_approval(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        os.environ["FAKE_ADB_FOREGROUND"] = (
+            "  mCurrentFocus=Window{2f8e1 u0 "
+            "com.android.chrome/com.android.chrome.Main}"
+        )
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertNotIn("'text'", self.adb_log())
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["detail"], "app_changed")
+
+    def test_text_refuses_when_the_screen_changed(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        self.set_screen(
+            make_png(blocks=((900, 730, 1000, 830, 10, 200, 10, 255),))
+        )
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertNotIn("'text'", self.adb_log())
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["detail"], "screen_changed")
+
+    def test_text_typing_failure_is_reported(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        os.environ["FAKE_ADB_INPUT_FAIL"] = "1"
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["state"], "failed")
+        self.assertEqual(state["detail"], "action_failed")
+        self.assertFalse(
+            any(part["type"] == "image" for part in polled["result"]["content"])
+        )
+
+    def test_text_never_appears_in_server_logs(self):
+        cookie, csrf = self.text_ready()
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            key = self.text_key()
+            self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertNotIn(self.TEXT_PHRASE, buffer.getvalue())
+
+    def test_text_is_not_exposed_by_default(self):
+        self.assertNotIn("android_text", bridge.DEFAULT_EXPOSED_TOOLS)
+        empty = tempfile.mkdtemp(prefix="bridge-empty-", dir=self.tmp)
+        self.assertNotIn("android_text", bridge.load_exposed_tools(empty))
+        config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
+        with open(config_path, encoding="utf-8") as handle:
+            self.assertNotIn("android_text", handle.read())
+
+
+    def test_text_refuses_hash_and_question_mark(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        for value in ("issue #42", "#comment", "what?", "a#b"):
+            with self.subTest(value=value):
+                _, payload = self.text_proposal(text=value)
+                self.assertTrue(payload["result"]["isError"], payload)
+                self.assertIn(
+                    "text contains unsupported characters",
+                    payload["result"]["content"][0]["text"],
+                )
+        self.assertEqual(self.server.approvals.pending(), [])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_text_proposal_refuses_an_empty_foreground_package(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_TEXT_FIELD)
+        os.environ["FAKE_ADB_FOREGROUND"] = ""
+        _, payload = self.text_proposal()
+        self.assertTrue(payload["result"]["isError"], payload)
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "foreground_unavailable"
+        )
+        self.assertEqual(self.server.approvals.pending(), [])
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_text_approval_refuses_an_empty_expected_package(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        record = self.server.approvals.get(key)
+        record["action"]["app_package"] = ""
+        record["fingerprint"] = control_actions.fingerprint(
+            record["action"], record["device"], record["preshot"]
+        )
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        record = self.server.approvals.get(key)
+        self.assertEqual(record["state"], "failed")
+        self.assertEqual(record["detail"], "app_changed")
+        self.assertNotIn("'text'", self.adb_log())
+
+    def test_text_approval_refuses_an_empty_current_package(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        os.environ["FAKE_ADB_FOREGROUND"] = ""
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        record = self.server.approvals.get(key)
+        self.assertEqual(record["state"], "failed")
+        self.assertEqual(record["detail"], "app_changed")
+        self.assertNotIn("'text'", self.adb_log())
+
+    def test_text_result_reports_length_not_text(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        _, polled = self.result(key)
+        state = json.loads(polled["result"]["content"][0]["text"])
+        self.assertEqual(state["state"], "executed")
+        self.assertEqual(state["text_length"], len(self.TEXT_PHRASE))
+        self.assertNotIn("text", state)
+        self.assertNotIn(self.TEXT_PHRASE, json.dumps(state))
+
+    def test_text_version_is_bumped(self):
+        config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
+        with open(config_path, encoding="utf-8") as handle:
+            self.assertIn('version: "0.3.23"', handle.read())
+        self.assertEqual(bridge.VERSION, "0.3.23")
 
 
 if __name__ == "__main__":

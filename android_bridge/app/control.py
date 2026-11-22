@@ -34,7 +34,10 @@ SWIPE_MAX_ANGLE_DEGREES = 20
 # approval usable for an unbounded time.
 APPROVAL_TTL_SECONDS = 600.0
 MAX_PENDING = 3
-_TEXT_RE = re.compile(r"\A[A-Za-z0-9 .,!?@#_+:\-]{1,%d}\Z" % MAX_TEXT_LEN)
+# `adb shell` still hands the command to the device shell, so the set stays
+# deliberately narrow: no quotes, #, ?, *, ;, |, &, $, backticks, parentheses,
+# backslashes, newlines or non-ASCII.
+_TEXT_RE = re.compile(r"\A[A-Za-z0-9 .,!@_+:\-]{1,%d}\Z" % MAX_TEXT_LEN)
 
 # Screen-element descriptions (0.3.21). The label is what the approval card
 # shows so a human can recognise the target without reading coordinates.
@@ -45,6 +48,28 @@ UNKNOWN_TARGET = "Unknown — could not check."
 _BOUNDS_RE = re.compile(
     r"\A\[\s*(-?\d{1,5})\s*,\s*(-?\d{1,5})\s*\]"
     r"\[\s*(-?\d{1,5})\s*,\s*(-?\d{1,5})\s*\]\Z"
+)
+
+# Typing (0.3.23). A text proposal is only made for one clearly focused,
+# ordinary text field. The label shown on the card is the field's content-desc
+# or resource-id, never its contents, so text already in the field cannot leak.
+_NOTE_NO_FIELD = "no_focused_text_field"
+_NOTE_SENSITIVE = "sensitive_field_refused"
+_NOTE_AMBIGUOUS = "ambiguous_text_field"
+NOTE_NO_FIELD = "No focused text field detected."
+NOTE_SENSITIVE = "Sensitive text field - typing refused."
+NOTE_AMBIGUOUS = "More than one focused text field - typing refused."
+_EDITABLE_CLASS_MARKERS = ("edittext", "textfield", "autocompletetextview")
+# Words that mark a field as carrying a secret: password, PIN, one-time code,
+# payment card data or an account/API secret. Matched on whole words inside
+# resource-id, content-desc and hint so "spinner" is not a PIN.
+_SENSITIVE_WORD_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:"
+    r"pass(?:word|wd|phrase|code)?|pwd|pin|otp|one[ _-]?time(?:[ _-]?code)?|"
+    r"cvv|cvc|ccv|card[ _-]?(?:number|no)|credit[ _-]?card|"
+    r"iban|ssn|security[ _-]?code|secret|api[ _-]?key|token|"
+    r"account[ _-]?(?:number|no)|routing[ _-]?number|sort[ _-]?code"
+    r")(?:$|[^a-z0-9])"
 )
 
 
@@ -254,11 +279,36 @@ def swipe_headline(action):
     return "DeepSeek wants to %s in %s." % (direction, app)
 
 
-def validate_text(text):
-    text = (text or "").strip()
-    if not _TEXT_RE.match(text):
-        raise ActionError("text contains unsupported characters")
-    return {"type": "text", "text": text}
+def text_headline(action):
+    """The exact approval-card sentence for a text proposal."""
+    app = action.get("app") or "the current app"
+    return "DeepSeek wants to type in %s" % app
+
+
+def validate_text(text, purpose=None, reason=None):
+    """Restricted ordinary text, at most 200 characters.
+
+    Leading and trailing whitespace is trimmed before approval, so the card,
+    the stored action and the input command always agree. Purpose and reason
+    are optional here so the charset can be checked on its own; a proposal
+    must supply both.
+    """
+    if not isinstance(text, str):
+        raise ActionError("text is required")
+    cleaned = text.strip()
+    if not cleaned:
+        raise ActionError("text is required")
+    if not _TEXT_RE.match(cleaned):
+        raise ActionError(
+            "text contains unsupported characters (letters, digits, spaces "
+            "and .,!@_+:- only)"
+        )
+    action = {"type": "text", "text": cleaned}
+    if purpose is not None:
+        action["purpose"] = validate_purpose(purpose)
+    if reason is not None:
+        action["reason"] = validate_reason(reason)
+    return action
 
 
 def _clean_label(value):
@@ -361,6 +411,135 @@ def _node_clickable(node):
 def _contains(bounds, x, y):
     x1, y1, x2, y2 = bounds
     return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _node_focused(node):
+    value = (node.get("focused", "false") or "false").strip().lower()
+    return value == "true"
+
+
+def _node_editable(node):
+    """An actual text input, identified by class or an editable attribute."""
+    value = (node.get("editable", "") or "").strip().lower()
+    if value == "true":
+        return True
+    class_name = (node.get("class", "") or "").lower()
+    return any(marker in class_name for marker in _EDITABLE_CLASS_MARKERS)
+
+
+def _field_is_secret(node):
+    """True for password, PIN, one-time-code, payment and secret fields.
+
+    Only metadata is inspected - never the field's text - so a refusal cannot
+    echo what the field already contains.
+    """
+    if (node.get("password", "false") or "false").strip().lower() == "true":
+        return True
+    class_name = (node.get("class", "") or "").lower()
+    if "password" in class_name:
+        return True
+    for attribute in ("resource-id", "content-desc", "hint"):
+        value = (node.get(attribute, "") or "").lower()
+        if value and _SENSITIVE_WORD_RE.search(value):
+            return True
+    return False
+
+
+def _field_label(node):
+    """A safe name for a text field: content-desc, then resource-id.
+
+    The field's own text is never used: it may hold a previous query, an
+    address or a name that the approval card has no need to reveal.
+    """
+    for attribute in ("content-desc", "resource-id"):
+        label = _clean_label(node.get(attribute, ""))
+        if label:
+            return label
+    return ""
+
+
+def _unidentified_field(description, reason, sensitive=False):
+    return {
+        "identified": False,
+        "reason": reason,
+        "sensitive": bool(sensitive),
+        "label": "",
+        "bounds": [],
+        "description": description,
+        "clickable": False,
+    }
+
+
+def focused_text_field(xml_text):
+    """Describe the one focused, visible, editable text field, or refuse.
+
+    Refuses when the dump cannot be read, when nothing editable is focused,
+    when several fields are focused at once, and for any password, PIN,
+    payment or other secret field. The refusal carries a fixed reason token;
+    no field contents are included.
+    """
+    nodes = _nodes(xml_text)
+    if not nodes:
+        return _unidentified_field(UNKNOWN_TARGET, "target_unverified")
+
+    focused = []
+    for node, _sensitive in nodes:
+        if not _node_visible(node) or not _node_focused(node):
+            continue
+        if not _node_editable(node):
+            continue
+        bounds = _parse_bounds(node.get("bounds"))
+        if bounds is None:
+            continue
+        focused.append((node, bounds))
+
+    if not focused:
+        return _unidentified_field(NOTE_NO_FIELD, _NOTE_NO_FIELD)
+    if len(focused) > 1:
+        return _unidentified_field(NOTE_AMBIGUOUS, _NOTE_AMBIGUOUS)
+
+    node, bounds = focused[0]
+    if _field_is_secret(node):
+        return _unidentified_field(
+            NOTE_SENSITIVE, _NOTE_SENSITIVE, sensitive=True
+        )
+
+    label = _field_label(node)
+    if label:
+        description = 'text field "%s" at [%d,%d][%d,%d]' % (
+            label, bounds[0], bounds[1], bounds[2], bounds[3]
+        )
+    else:
+        description = "focused text field at [%d,%d][%d,%d]" % bounds
+    return {
+        "identified": True,
+        "reason": "",
+        "sensitive": False,
+        "label": label,
+        "bounds": [bounds[0], bounds[1], bounds[2], bounds[3]],
+        "description": description,
+        "clickable": True,
+    }
+
+
+def text_targets_match(proposed, current):
+    """True only when the approval-time recheck names the same focused field.
+
+    Fails closed: an unreadable dump, a missing field or a field that changed
+    size, position or identity is a mismatch, and nothing is typed.
+    """
+    if not isinstance(proposed, dict) or not isinstance(current, dict):
+        return False
+    for record in (proposed, current):
+        if not record.get("identified"):
+            return False
+        bounds = record.get("bounds")
+        if not isinstance(bounds, list) or len(bounds) != 4:
+            return False
+    return (
+        proposed.get("label") == current.get("label")
+        and proposed.get("bounds") == current.get("bounds")
+    )
 
 
 def unknown_target():
@@ -496,7 +675,9 @@ def describe(action):
             action["duration_ms"],
         )
     if kind == "text":
-        return "Type text: %r" % action["text"]
+        # Never echo the contents in a description: it lands in panel history
+        # and logs. The approval card shows the text from the action itself.
+        return "Type %d characters" % len(action.get("text", ""))
     return "Unknown action"
 
 
@@ -524,8 +705,15 @@ def adb_args(action, serial):
                 str(action["x2"]), str(action["y2"]),
                 str(action["duration_ms"])]
     if kind == "text":
+        # Re-validated here so nothing but restricted ordinary text can reach
+        # the fixed argv. The text is one argv element, never a shell string:
+        # a space becomes %s for `input text` and no other metacharacter is
+        # permitted by _TEXT_RE.
+        text = action.get("text")
+        if not isinstance(text, str) or not _TEXT_RE.match(text):
+            raise ActionError("unsupported text")
         return ["-s", serial, "shell", "input", "text",
-                action["text"].replace(" ", "%s")]
+                text.replace(" ", "%s")]
     raise ActionError("unsupported action")
 
 
