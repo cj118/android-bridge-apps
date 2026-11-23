@@ -2,13 +2,11 @@ FROM python:3.12-alpine
 
 WORKDIR /app
 
-COPY app/server.py /app/server.py
-COPY app/adbctl.py /app/adbctl.py
-COPY app/pngcheck.py /app/pngcheck.py
-COPY app/control.py /app/control.py
-COPY app/options_bridge.py /app/options_bridge.py
-COPY app/adb_home.py /app/adb_home.py
-COPY app/reconnect.py /app/reconnect.py
+# Every module under app/ must reach the image. 0.3.28 copied them one at a
+# time and never copied app/annotate.py, so the container died at import time.
+# Ownership and modes are unchanged: files stay root-owned, with the source
+# permissions the per-file copies produced.
+COPY app/*.py /app/
 COPY app/entrypoint.sh /entrypoint.sh
 
 RUN addgroup -g 10001 app \

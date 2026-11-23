@@ -1,5 +1,26 @@
 # Android Bridge changelog
 
+## 0.3.29
+
+- Fix a fatal startup crash in 0.3.28. `app/server.py` imports `annotate`, but
+  the Dockerfile copied app modules one file at a time and `app/annotate.py`
+  was never listed, so the container died at import time with
+  `ModuleNotFoundError: No module named 'annotate'` and `/app/server.py`
+  line 27.
+- The Dockerfile now copies every app module in a single instruction,
+  `COPY app/*.py /app/`. Ownership and permissions are unchanged: files stay
+  root-owned with the source modes the per-file copies produced.
+- New `tests/test_dockerfile.py` parses the Dockerfile's `COPY`/`ADD`
+  instructions, resolves them against the build context and fails if any
+  `app/*.py` module would not end up in the image, so a module added later
+  cannot be silently dropped again. It also fails if an app copy gains
+  `--chown` or `--chmod`, and it self-checks that it really detects a dropped
+  module.
+- Version metadata, the application `VERSION` constant, `/status`,
+  MCP `serverInfo.version` and `config.yaml` all report 0.3.29.
+- No functional change to viewing, pairing, approvals, STOP, the tool
+  allowlist or the MCP gates.
+
 ## 0.3.28
 
 - `android_screenshot` accepts two read-only options. `grid` draws lines every
