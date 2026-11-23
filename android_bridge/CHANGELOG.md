@@ -1,5 +1,16 @@
 # Android Bridge changelog
 
+## 0.3.27
+
+- Version-label correction. The application `VERSION` constant still said
+  0.3.25 after the 0.3.26 build, so the startup banner, `/status` version and
+  MCP `serverInfo.version` disagreed with the add-on metadata. All of them now
+  report 0.3.27, matching `config.yaml`.
+- No functional change. Connect without pairing, the saved ADB port and
+  hardware identity checks, the seven tools, human approval for tap/swipe/
+  text, reject and STOP, approval notifications, and the existing saved
+  pairing and credentials are unchanged.
+
 ## 0.3.26
 
 - New `Connect (no pairing)` form under `Connect saved tablet`. The host is the

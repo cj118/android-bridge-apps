@@ -3370,8 +3370,8 @@ class ControlSecurityTests(unittest.TestCase):
     def test_text_version_is_bumped(self):
         config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
         with open(config_path, encoding="utf-8") as handle:
-            self.assertIn('version: "0.3.26"', handle.read())
-        self.assertEqual(bridge.VERSION, "0.3.25")
+            self.assertIn('version: "0.3.27"', handle.read())
+        self.assertEqual(bridge.VERSION, "0.3.27")
 
     # ---------- app labels (0.3.25) ----------
 
