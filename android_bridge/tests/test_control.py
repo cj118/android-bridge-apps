@@ -1343,7 +1343,9 @@ class ControlSecurityTests(unittest.TestCase):
             "GET", "/control?flash=%3Cscript%3Ealert(1)%3C%2Fscript%3E", cookie
         )
         self.assertEqual(status, 200)
-        self.assertNotIn(b"<script>", page)
+        # The page ships exactly one fixed script. An injected value must not
+        # add another one, or appear at all.
+        self.assertEqual(page.count(b"<script>"), 1)
         self.assertNotIn(b"alert(1)", page)
 
         status, page, _ = self.req("GET", "/control?flash=zzz", cookie)
@@ -1662,7 +1664,9 @@ class ControlSecurityTests(unittest.TestCase):
             "41'234",
         )
         _cookie, _csrf, page, parser = self.render_control_page()
-        self.assertNotIn("script", parser.tags)
+        # Only the page's own fixed script may exist; the saved host must
+        # arrive escaped and must not create a second one.
+        self.assertEqual(parser.tags.count("script"), 1)
         self.assertIn(
             b"10.0.0.1&#x27;&gt;&lt;script&gt;alert(1)&lt;/script&gt;", page
         )
@@ -2461,8 +2465,8 @@ class ControlSecurityTests(unittest.TestCase):
             "Warning: this will press a button",
             "<img src='data:image/png;base64,",
             "AI reason:",
-            "<button>Approve</button>",
-            "<button>Reject</button>",
+            "class='approve-btn'>Approve</button>",
+            "class='reject-btn'>Reject</button>",
         )
         positions = [text.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
@@ -3369,8 +3373,8 @@ class ControlSecurityTests(unittest.TestCase):
     def test_text_version_is_bumped(self):
         config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
         with open(config_path, encoding="utf-8") as handle:
-            self.assertIn('version: "0.3.29"', handle.read())
-        self.assertEqual(bridge.VERSION, "0.3.29")
+            self.assertIn('version: "0.3.30"', handle.read())
+        self.assertEqual(bridge.VERSION, "0.3.30")
 
     # ---------- app labels (0.3.25) ----------
 
@@ -3785,6 +3789,223 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertGreaterEqual(
             text.count("data:image/png;base64,"), 2
         )
+
+
+    # ---------- 0.3.30: waiting for a decision ----------
+
+    def result_wait(self, key, seconds):
+        return self.mcp({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "android_action_result",
+                "arguments": {"id": key, "wait_seconds": seconds},
+            },
+        })
+
+    def waited_state(self, payload):
+        return json.loads(payload["result"]["content"][0]["text"])
+
+    def in_background(self, delay, action):
+        box = {}
+
+        def run():
+            time.sleep(delay)
+            box["result"] = action()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        return worker, box
+
+    def test_action_result_waits_then_returns_executed(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        worker, box = self.in_background(
+            0.4, lambda: self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        )
+        started = time.monotonic()
+        status, payload = self.result_wait(key, 10)
+        elapsed = time.monotonic() - started
+        worker.join()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.waited_state(payload)["state"], "executed")
+        self.assertEqual(box["result"][0], 303)
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertLess(elapsed, 8)
+        self.assertIn("'shell', 'input', 'tap', '540', '780'", self.adb_log())
+
+    def test_action_result_wait_returns_on_reject(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        worker, _box = self.in_background(
+            0.3, lambda: self.ctl("/control/reject", {"id": key}, cookie, csrf)
+        )
+        started = time.monotonic()
+        status, payload = self.result_wait(key, 10)
+        elapsed = time.monotonic() - started
+        worker.join()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.waited_state(payload)["state"], "rejected")
+        self.assertLess(elapsed, 8)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_action_result_wait_returns_on_stop(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        worker, _box = self.in_background(
+            0.4, lambda: self.ctl("/control/stop", {}, cookie, csrf)
+        )
+        started = time.monotonic()
+        status, payload = self.result_wait(key, 10)
+        elapsed = time.monotonic() - started
+        worker.join()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.waited_state(payload)["state"], "cancelled")
+        # STOP notifies the waiter; it must not sit out the remaining wait.
+        self.assertLess(elapsed, 3)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_action_result_wait_timeout_returns_pending(self):
+        self.start_control()
+        key = self.new_proposal()
+        started = time.monotonic()
+        status, payload = self.result_wait(key, 1)
+        elapsed = time.monotonic() - started
+        self.assertEqual(status, 200)
+        self.assertEqual(self.waited_state(payload)["state"], "pending")
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 5)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_action_result_wait_seconds_out_of_range_is_refused(self):
+        self.start_control()
+        key = self.new_proposal()
+        for bad in (241, -1, "5", 2.5, True):
+            with self.subTest(wait_seconds=bad):
+                status, payload = self.result_wait(key, bad)
+                self.assertEqual(status, 200)
+                self.assertTrue(payload["result"]["isError"], payload)
+                self.assertEqual(
+                    payload["result"]["content"][0]["text"],
+                    "invalid_wait_seconds",
+                )
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_action_result_advertises_wait_seconds(self):
+        status, payload = self.mcp(
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/list"}
+        )
+        self.assertEqual(status, 200)
+        tools = {tool["name"]: tool for tool in payload["result"]["tools"]}
+        schema = tools["android_action_result"]["inputSchema"]
+        wait = schema["properties"]["wait_seconds"]
+        self.assertEqual((wait["minimum"], wait["maximum"]), (0, 240))
+        self.assertEqual(wait["default"], 0)
+        for name in (
+            "android_tap",
+            "android_swipe",
+            "android_text",
+            "android_action_result",
+        ):
+            with self.subTest(tool=name):
+                self.assertIn("wait_seconds 180", tools[name]["description"])
+                self.assertIn("Never end the turn", tools[name]["description"])
+
+    # ---------- 0.3.30: decision buttons and banners ----------
+
+    def current_page(self, cookie):
+        status, page, _headers = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        return page.decode("utf-8")
+
+    def banner_after(self, headers, cookie):
+        self.assertEqual(headers.get("Location") is not None, True)
+        status, page, _headers = self.follow(headers["Location"], cookie)
+        self.assertEqual(status, 200)
+        return page.decode("utf-8")
+
+    def test_decision_buttons_are_large_green_and_red(self):
+        cookie, _csrf = self.start_control()
+        self.new_proposal()
+        page = self.current_page(cookie)
+        self.assertIn("class='approve-btn'", page)
+        self.assertIn("class='reject-btn'", page)
+        self.assertIn(".approve-btn{background:#1a7f37}", page)
+        self.assertIn(".reject-btn{background:#b42318}", page)
+        self.assertIn("min-height:64px", page)
+        self.assertIn("min-width:13rem", page)
+        self.assertIn("gap:1.5rem", page)
+        self.assertEqual(page.count("action='control/approve'"), 1)
+        self.assertEqual(page.count("action='control/reject'"), 1)
+        self.assertIn("data-decision='approve'", page)
+        self.assertIn("data-decision='reject'", page)
+
+    def test_press_locks_both_buttons_and_shows_progress(self):
+        cookie, _csrf = self.start_control()
+        self.new_proposal()
+        page = self.current_page(cookie)
+        self.assertIn("Approving...", page)
+        self.assertIn("Rejecting...", page)
+        self.assertIn("data-locked", page)
+        self.assertIn("addEventListener('submit',lock)", page)
+        self.assertIn("buttons[b].disabled=true", page)
+        self.assertIn(".approve-btn.pressed", page)
+        self.assertIn(".reject-btn.pressed", page)
+
+    def test_approve_banner_names_what_was_sent(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        page = self.banner_after(headers, cookie)
+        self.assertIn("banner banner-ok", page)
+        self.assertIn("✓ Approved - tap sent", page)
+
+        key = self.swipe_key()
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("✓ Approved - swipe sent", self.banner_after(headers, cookie))
+
+    def test_text_approval_banner_says_typing_was_sent(self):
+        cookie, csrf = self.text_ready()
+        key = self.text_key()
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        page = self.banner_after(headers, cookie)
+        self.assertIn("banner banner-ok", page)
+        self.assertIn("✓ Approved - typing sent", page)
+
+    def test_reject_banner_is_red(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, headers = self.ctl("/control/reject", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        page = self.banner_after(headers, cookie)
+        self.assertIn("banner banner-bad", page)
+        self.assertIn("✗ Rejected", page)
+
+    def test_expired_approval_shows_expired_banner(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.server.approvals.get(key)["expires"] = time.monotonic() - 1
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        page = self.banner_after(headers, cookie)
+        self.assertIn("banner banner-bad", page)
+        self.assertIn("✗ Approval expired - nothing was sent", page)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_reused_approval_shows_already_used_banner(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        page = self.banner_after(headers, cookie)
+        self.assertIn("banner banner-bad", page)
+        self.assertIn("✗ Approval already used - nothing was sent", page)
+        self.assertEqual(self.adb_log().count("'input'"), 1)
 
 
 if __name__ == "__main__":

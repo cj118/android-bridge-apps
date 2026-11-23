@@ -1,5 +1,38 @@
 # Android Bridge changelog
 
+## 0.3.30
+
+- `android_action_result` takes an optional `wait_seconds` (0-240, default 0).
+  It blocks until the action leaves `pending`/`approved`, returning as soon as
+  the action is executed, rejected, expired, cancelled by STOP, or the wait
+  runs out. A STOP wakes a waiting call immediately instead of leaving it to
+  finish its wait. `wait_for()` in `control.py` waits on a condition notified by
+  every approval state change; the records themselves, CSRF, the login nonce
+  and single-use approvals are unchanged.
+- The `android_tap`, `android_swipe`, `android_text` and
+  `android_action_result` tool descriptions now tell the caller to poll with
+  `wait_seconds` 180, repeat while pending, and never end the turn while an
+  action is pending.
+- The Control page approval card now shows a large green **Approve** button and
+  a large red **Reject** button, at least 64 px tall with 1.5 rem of clear space
+  between them, so a phone tap is unambiguous.
+- On press, the pressed button changes colour and its label becomes
+  `Approving...` or `Rejecting...`, and both buttons in the card are disabled so
+  a second press cannot submit twice. This is one fixed inline script; the page
+  sets no Content-Security-Policy and none was added or weakened. The script is
+  static markup only: no user or flash value is ever placed in it, and the
+  escaping tests still assert that an injected value creates no extra script.
+- A large banner now appears at the top of the Control page after a decision:
+  green `✓ Approved - tap sent` (or `swipe sent` / `typing sent`) or red
+  `✗ Rejected`. It also appears for an approval that had already expired or had
+  already been used, red and stating that nothing was sent.
+- New tests cover: waiting then returning `executed`, returning on reject,
+  returning on STOP, timeout leaving `pending`, and out-of-range
+  `wait_seconds` being refused; the button markup, the banner messages, and the
+  double-press lock.
+- Version metadata, the application `VERSION` constant, MCP `serverInfo.version`
+  and `config.yaml` all report 0.3.30.
+
 ## 0.3.29
 
 - Fix a fatal startup crash in 0.3.28. `app/server.py` imports `annotate`, but

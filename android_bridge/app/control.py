@@ -753,14 +753,25 @@ class Approvals:
         self.records = {}
         self.order = []
         self._lock = threading.RLock()
+        # Wakes a waiting android_action_result call whenever a record leaves
+        # the in-flight states, including STOP cancelling it.
+        self._cond = threading.Condition(self._lock)
+
+    def _notify(self):
+        """Wake waiters. Always called with self._lock held."""
+        self._cond.notify_all()
 
     def _sweep(self):
         now = time.monotonic()
+        changed = False
         for record in self.records.values():
             if record["state"] in ("pending", "approved") and record["expires"] <= now:
                 record["state"] = "expired"
                 if record.get("finished") is None:
                     record["finished"] = now
+                changed = True
+        if changed:
+            self._notify()
         while len(self.order) > 20:
             oldest = self.order.pop(0)
             record = self.records.get(oldest)
@@ -835,6 +846,29 @@ class Approvals:
                 r for r in self.records.values() if r["state"] == "pending"
             ]
 
+    def wait_for(self, key, timeout):
+        """Block until the record is no longer pending or approved.
+
+        Returns the finished record, the still-in-flight record when the
+        timeout runs out, or None for an unknown id. STOP cancels records and
+        notifies, so a wait ends as soon as STOP runs.
+        """
+        with self._lock:
+            self._sweep()
+            record = self.records.get(key)
+            if record is None:
+                return None
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            while record["state"] in ("pending", "approved"):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return record
+                self._cond.wait(min(remaining, 0.2))
+                current = self.records.get(key)
+                if current is not None:
+                    record = current
+        return record
+
     def approve(self, key):
         with self._lock:
             return self._approve(key)
@@ -850,6 +884,7 @@ class Approvals:
         if fingerprint(record["action"], record["device"], record["preshot"]) != record["fingerprint"]:
             raise ActionError("approval binding mismatch")
         record["state"] = "approved"
+        self._notify()
         return record
 
     def complete(self, key, postshot, detail=""):
@@ -860,6 +895,7 @@ class Approvals:
                     state="executed", postshot=postshot, detail=detail,
                     finished=time.monotonic(),
                 )
+                self._notify()
 
     def fail(self, key, detail):
         with self._lock:
@@ -868,6 +904,7 @@ class Approvals:
                 record.update(
                     state="failed", detail=detail, finished=time.monotonic()
                 )
+                self._notify()
 
     def reject(self, key):
         with self._lock:
@@ -881,6 +918,7 @@ class Approvals:
             raise ActionError("approval is not pending")
         record["state"] = "rejected"
         record["finished"] = time.monotonic()
+        self._notify()
         return record
 
     def recent(self, limit=5):
@@ -897,12 +935,18 @@ class Approvals:
     def clear(self):
         """Cancel pending/approved work and keep bounded completed history."""
         with self._lock:
+            changed = False
             for key in list(self.records):
                 record = self.records[key]
                 if record["state"] in ("pending", "approved"):
                     record["state"] = "cancelled"
                     record["finished"] = time.monotonic()
                     self.records.pop(key, None)
+                    changed = True
+            if changed:
+                # A waiting android_action_result must see the cancellation
+                # immediately, not after its next poll interval.
+                self._notify()
             self.order = [key for key in self.order if key in self.records]
             while len(self.order) > 20:
                 oldest = self.order.pop(0)

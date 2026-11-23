@@ -30,7 +30,7 @@ import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.29"
+VERSION = "0.3.30"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -109,7 +109,77 @@ _FLASH_MESSAGES = {
         "Could not verify the saved tablet. Nothing was changed."
     ),
     "screen_changed": "Screen changed — ask again.",
+    # Decision banners. "executed" and "rejected" keep their keys so existing
+    # redirects and tests are unchanged; the banner is added above them.
+    "approval_expired": "Approval expired - nothing was sent.",
+    "approval_used": "Approval already used - nothing was sent.",
 }
+
+# Large green/red decision buttons, 64 px tall with real space between them,
+# plus the pressed state that shows the press registered.
+_CONTROL_CSS = (
+    "<style>"
+    ".decision{display:flex;flex-wrap:wrap;gap:1.5rem;margin:1rem 0}"
+    ".decision form{margin:0}"
+    ".decision button{min-height:64px;min-width:13rem;padding:1rem 2rem;"
+    "border:0;border-radius:10px;font-size:1.45rem;font-weight:700;"
+    "color:#fff;cursor:pointer}"
+    ".approve-btn{background:#1a7f37}"
+    ".reject-btn{background:#b42318}"
+    ".approve-btn:active{background:#0f5a26}"
+    ".reject-btn:active{background:#7a170f}"
+    ".approve-btn.pressed,.approve-btn[disabled]{background:#0b3d1a;"
+    "color:#cfe8d5}"
+    ".reject-btn.pressed,.reject-btn[disabled]{background:#4d0f0a;"
+    "color:#f3cfcb}"
+    ".decision button[disabled]{cursor:not-allowed}"
+    ".banner{font-size:1.6rem;font-weight:700;line-height:1.3;"
+    "padding:1rem 1.25rem;border-radius:10px;margin:0 0 1.25rem;color:#fff}"
+    ".banner-ok{background:#1a7f37}"
+    ".banner-bad{background:#b42318}"
+    "</style>"
+)
+
+# Inline script: the page sets no Content-Security-Policy, so this is allowed
+# without widening anything. A press locks both buttons in the card and shows
+# "Approving..." or "Rejecting..." so a second press cannot submit twice.
+_CONTROL_JS = (
+    "<script>"
+    "(function(){"
+    "function lock(ev){"
+    "var form=ev.target;"
+    "if(!form||form.nodeName!=='FORM'){return true;}"
+    "if(form.getAttribute('data-locked')==='1'){ev.preventDefault();return false;}"
+    "form.setAttribute('data-locked','1');"
+    "var scope=form.parentNode||form;"
+    "var forms=scope.querySelectorAll?scope.querySelectorAll('form'):[];"
+    "var count=forms.length;"
+    "for(var g=0;g<count;g++){"
+    "var buttons=forms[g].querySelectorAll('button');"
+    "for(var b=0;b<buttons.length;b++){buttons[b].disabled=true;}"
+    "}"
+    "var approve=form.getAttribute('data-decision')==='approve';"
+    "var btn=ev.submitter||form.querySelector('button');"
+    "if(btn){"
+    "btn.className=approve?'approve-btn pressed':'reject-btn pressed';"
+    "btn.textContent=approve?'Approving...':'Rejecting...';"
+    "}"
+    "return true;"
+    "}"
+    "function attach(){"
+    "var forms=document.querySelectorAll('.decision form');"
+    "var total=forms.length;"
+    "for(var n=0;n<total;n++){"
+    "forms[n].addEventListener('submit',lock);"
+    "}"
+    "}"
+    "if(document.readyState==='loading'){"
+    "document.addEventListener('DOMContentLoaded',attach);"
+    "}else{attach();}"
+    "})();"
+    "</script>"
+)
+
 _INGRESS_PATH_RE = re.compile(r"\A/api/hassio_ingress/[A-Za-z0-9_-]{1,64}\Z")
 _TRACKED_HEADERS = (
     "origin",
@@ -1182,7 +1252,9 @@ class Handler(BaseHTTPRequestHandler):
             "description": (
                 "Propose a tap. It does not execute: a human must approve it in "
                 "the bridge Control page. The result names the element found at "
-                "the given point. Poll android_action_result afterwards."
+                "the given point. After proposing, call android_action_result "
+                "with wait_seconds 180; if it is still pending, call it again. "
+                "Never end the turn while an action is pending."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1208,7 +1280,9 @@ class Handler(BaseHTTPRequestHandler):
                 "from every screen edge, 100 px to 70% of the screen apart and "
                 "within 20 degrees of an axis, over 300-1500 ms. The result names "
                 "the direction, the foreground app and the element under the "
-                "start point. Poll android_action_result afterwards."
+                "start point. After proposing, call android_action_result with "
+                "wait_seconds 180; if it is still pending, call it again. "
+                "Never end the turn while an action is pending."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1248,8 +1322,10 @@ class Handler(BaseHTTPRequestHandler):
                 "A proposal is refused unless exactly one visible, focused, "
                 "ordinary editable field is found; password, PIN, payment and "
                 "other secret fields are refused. Text is limited to letters, "
-                "digits, spaces and .,!@_+:- up to 200 characters. Poll "
-                "android_action_result afterwards."
+                "digits, spaces and .,!@_+:- up to 200 characters. After "
+                "proposing, call android_action_result with wait_seconds 180; "
+                "if it is still pending, call it again. Never end the turn "
+                "while an action is pending."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1287,10 +1363,29 @@ class Handler(BaseHTTPRequestHandler):
         },
         {
             "name": "android_action_result",
-            "description": "Poll a proposed action by id; returns state and the post-action screenshot.",
+            "description": (
+                "Poll a proposed action by id; returns state and the "
+                "post-action screenshot. Pass wait_seconds to block until the "
+                "action is no longer pending: after proposing an action call "
+                "this with wait_seconds 180; if it is still pending, call it "
+                "again. Never end the turn while an action is pending."
+            ),
             "inputSchema": {
                 "type": "object",
-                "properties": {"id": {"type": "string", "maxLength": 32}},
+                "properties": {
+                    "id": {"type": "string", "maxLength": 32},
+                    "wait_seconds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 240,
+                        "default": 0,
+                        "description": (
+                            "Seconds to wait for the action to stop being "
+                            "pending. Returns immediately if it is already "
+                            "finished, or as soon as STOP cancels it."
+                        ),
+                    },
+                },
                 "required": ["id"],
                 "additionalProperties": False,
             },
@@ -1683,10 +1778,27 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(arguments, dict):
             arguments = {}
         key = str(arguments.get("id") or "")
+        wait_seconds = arguments.get("wait_seconds", 0)
+        if wait_seconds is None:
+            wait_seconds = 0
+        if (
+            isinstance(wait_seconds, bool)
+            or not isinstance(wait_seconds, int)
+            or wait_seconds < 0
+            or wait_seconds > 240
+        ):
+            self._mcp_error(message_id, "invalid_wait_seconds")
+            return
         record = self.server.approvals.get(key)
         if record is None:
             self._mcp_error(message_id, "unknown_approval")
             return
+        if wait_seconds:
+            # Blocks until the action leaves pending/approved, or the wait
+            # runs out. STOP cancels and notifies, so this returns at once.
+            waited = self.server.approvals.wait_for(key, wait_seconds)
+            if waited is not None:
+                record = waited
         target = record["action"].get("target") or {}
         payload = {
             "id": key,
@@ -2304,14 +2416,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond({"error": "control_inactive"}, 409, flash="error")
                 return
             record = self.server.approvals.get(key)
-            if record is None or record["state"] != "pending":
+            if record is None:
                 self._respond(
-                    {"error": "approval is not pending"}, 409, flash="error"
+                    {"error": "approval is not pending"}, 409,
+                    flash="approval_used",
+                )
+                return
+            if record["state"] == "expired":
+                self._respond(
+                    {"error": "approval expired"}, 409,
+                    flash="approval_expired",
+                )
+                return
+            if record["state"] != "pending":
+                self._respond(
+                    {"error": "approval is not pending"}, 409,
+                    flash="approval_used",
                 )
                 return
             if record["expires"] <= time.monotonic():
                 self.server.approvals.fail(key, "expired")
-                self._respond({"error": "approval expired"}, 409, flash="error")
+                self._respond(
+                    {"error": "approval expired"}, 409,
+                    flash="approval_expired",
+                )
                 return
             if (
                 control_actions.fingerprint(
@@ -2590,7 +2718,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.server.approvals.reject(key)
         except control_actions.ActionError as exc:
-            self._respond({"error": str(exc)}, 409, flash="error")
+            flash = (
+                "approval_used"
+                if str(exc) == "approval is not pending"
+                else "error"
+            )
+            self._respond({"error": str(exc)}, 409, flash=flash)
             return
         self._respond({"status": "rejected"}, flash="rejected")
 
@@ -2806,16 +2939,7 @@ class Handler(BaseHTTPRequestHandler):
             "style='display:block;width:100%%;max-width:100%%;height:auto'>"
             "%s</div>"
             "<p><b>AI reason:</b> %s</p>"
-            "<form method='post' action='control/approve' "
-            "style='display:inline'>"
-            "<input type='hidden' name='csrf' value='%s'>"
-            "<input type='hidden' name='id' value='%s'>"
-            "<button>Approve</button></form> "
-            "<form method='post' action='control/reject' "
-            "style='display:inline'>"
-            "<input type='hidden' name='csrf' value='%s'>"
-            "<input type='hidden' name='id' value='%s'>"
-            "<button>Reject</button></form>"
+            "%s"
             "<p style='margin-top:.5rem;color:#aaa'>%d &times; %d &middot; "
             "%s &middot; id %s &middot; expires in %s</p></div>"
             % (
@@ -2826,8 +2950,7 @@ class Handler(BaseHTTPRequestHandler):
                 image,
                 self._swipe_overlay_html(action, width, height, record["id"]),
                 reason,
-                csrf_attr, record_id,
-                csrf_attr, record_id,
+                self._decision_buttons_html(record_id, csrf_attr),
                 width, height, device, record_id, remaining,
             )
         )
@@ -2896,16 +3019,7 @@ class Handler(BaseHTTPRequestHandler):
             "<img src='data:image/png;base64,%s' "
             "style='display:block;width:100%%;max-width:100%%;height:auto'>"
             "%s</div>"
-            "<form method='post' action='control/approve' "
-            "style='display:inline'>"
-            "<input type='hidden' name='csrf' value='%s'>"
-            "<input type='hidden' name='id' value='%s'>"
-            "<button>Approve</button></form> "
-            "<form method='post' action='control/reject' "
-            "style='display:inline'>"
-            "<input type='hidden' name='csrf' value='%s'>"
-            "<input type='hidden' name='id' value='%s'>"
-            "<button>Reject</button></form>"
+            "%s"
             "<p style='margin-top:.5rem;color:#aaa'>%d &times; %d &middot; "
             "%s &middot; id %s &middot; expires in %s</p></div>"
             % (
@@ -2917,17 +3031,73 @@ class Handler(BaseHTTPRequestHandler):
                 reason,
                 image,
                 self._field_overlay_html(field, width, height),
-                csrf_attr, record_id,
-                csrf_attr, record_id,
+                self._decision_buttons_html(record_id, csrf_attr),
                 width, height, device, record_id, remaining,
             )
         )
+
+    def _decision_buttons_html(self, record_id, csrf_attr):
+        """Large green Approve and red Reject, one form each, side by side."""
+        return (
+            "<div class='decision'>"
+            "<form method='post' action='control/approve' data-decision='approve'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<input type='hidden' name='id' value='%s'>"
+            "<button type='submit' class='approve-btn'>Approve</button></form>"
+            "<form method='post' action='control/reject' data-decision='reject'>"
+            "<input type='hidden' name='csrf' value='%s'>"
+            "<input type='hidden' name='id' value='%s'>"
+            "<button type='submit' class='reject-btn'>Reject</button></form>"
+            "</div>"
+            % (csrf_attr, record_id, csrf_attr, record_id)
+        )
+
+    def _banner_html(self, flash):
+        """Big confirmation banner for a decision, or '' for other flashes."""
+        if flash == "executed":
+            noun = "action"
+            now = time.monotonic()
+            done = [
+                record for record in self.server.approvals.recent(10)
+                if record["state"] == "executed"
+                and now - (record.get("finished") or 0.0) <= 120
+            ]
+            if done:
+                latest = max(
+                    done, key=lambda record: record.get("finished") or 0.0
+                )
+                noun = {
+                    "tap": "tap",
+                    "swipe": "swipe",
+                    "text": "typing",
+                }.get(latest["action"].get("type"), "action")
+            text = "✓ Approved - %s sent" % noun
+            return (
+                "<div class='banner banner-ok'>%s</div>" % html.escape(text)
+            )
+        if flash == "rejected":
+            return "<div class='banner banner-bad'>✗ Rejected</div>"
+        if flash == "approval_expired":
+            return (
+                "<div class='banner banner-bad'>"
+                "✗ Approval expired - nothing was sent</div>"
+            )
+        if flash == "approval_used":
+            return (
+                "<div class='banner banner-bad'>"
+                "✗ Approval already used - nothing was sent</div>"
+            )
+        return ""
 
     def _control_page(self, nonce, flash=""):
         session = self.server.ui_sessions.get(nonce) or {}
         csrf = session.get("csrf", "")
         csrf_attr = html.escape(csrf, quote=True)
         message = _FLASH_MESSAGES.get(flash, "")
+        banner_html = self._banner_html(flash)
+        # These two have their own large banner; do not repeat them small.
+        if flash in ("approval_expired", "approval_used"):
+            message = ""
         flash_html = (
             "<p style='padding:.5rem;background:#223;color:#cfe'>%s</p>"
             % html.escape(message)
@@ -3014,16 +3184,7 @@ class Handler(BaseHTTPRequestHandler):
                 "%s"
                 "<p><b>Screen:</b> %d × %d — %s</p>"
                 "<p>Device: %s &middot; id %s &middot; expires in %s</p>"
-                "<form method='post' action='control/approve' "
-                "style='display:inline'>"
-                "<input type='hidden' name='csrf' value='%s'>"
-                "<input type='hidden' name='id' value='%s'>"
-                "<button>Approve</button></form> "
-                "<form method='post' action='control/reject' "
-                "style='display:inline'>"
-                "<input type='hidden' name='csrf' value='%s'>"
-                "<input type='hidden' name='id' value='%s'>"
-                "<button>Reject</button></form>"
+                "%s"
                 "</div>"
                 % (
                     headline,
@@ -3038,10 +3199,9 @@ class Handler(BaseHTTPRequestHandler):
                     device,
                     html.escape(record["id"], quote=True),
                     remaining,
-                    csrf_attr,
-                    html.escape(record["id"], quote=True),
-                    csrf_attr,
-                    html.escape(record["id"], quote=True),
+                    self._decision_buttons_html(
+                        html.escape(record["id"], quote=True), csrf_attr
+                    ),
                 )
             )
         viewing_open = self._viewing_open()
@@ -3099,8 +3259,9 @@ class Handler(BaseHTTPRequestHandler):
             )
         body = (
             "<html><head><meta charset='utf-8'>"
-            "<title>Android Bridge control</title>%s</head>"
+            "<title>Android Bridge control</title>%s%s</head>"
             "<body style='font-family:system-ui;max-width:60rem;margin:2rem auto'>"
+            "%s"
             "<h1>Android Bridge control</h1>"
             "%s"
             "<p>Viewing session: <b>%s</b> &middot; Control session: <b>%s</b></p>"
@@ -3126,9 +3287,11 @@ class Handler(BaseHTTPRequestHandler):
             "<input type='hidden' name='csrf' value='%s'>"
             "<button>Disconnect</button></form>"
             "<h2>Pending approvals</h2>%s"
-            "<h2>Recent results</h2>%s</body></html>"
+            "<h2>Recent results</h2>%s%s</body></html>"
             % (
+                _CONTROL_CSS,
                 refresh_html,
+                banner_html,
                 flash_html,
                 viewing,
                 control,
@@ -3143,6 +3306,7 @@ class Handler(BaseHTTPRequestHandler):
                 csrf_attr,
                 "".join(cards) or "<p>None.</p>",
                 self._result_cards(),
+                _CONTROL_JS,
             )
         )
         return body.encode("utf-8")
