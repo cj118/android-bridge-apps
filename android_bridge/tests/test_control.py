@@ -396,6 +396,8 @@ class ControlSecurityTests(unittest.TestCase):
             handle.write("0")
         self.server.last_proposal_at = 0.0
         self.server.control_minutes = bridge.CONTROL_MINUTES_DEFAULT
+        self.server.verified_transports.clear()
+        self.server.last_reconnect = None
         bridge.save_device(self.data_dir, "192.168.1.50", "41234")
         open(self.log_path, "w").close()
 
@@ -3368,7 +3370,7 @@ class ControlSecurityTests(unittest.TestCase):
     def test_text_version_is_bumped(self):
         config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
         with open(config_path, encoding="utf-8") as handle:
-            self.assertIn('version: "0.3.25"', handle.read())
+            self.assertIn('version: "0.3.26"', handle.read())
         self.assertEqual(bridge.VERSION, "0.3.25")
 
     # ---------- app labels (0.3.25) ----------
@@ -3554,6 +3556,141 @@ class ControlSecurityTests(unittest.TestCase):
             self.server.approvals.get(key)["state"], "pending"
         )
         self.assertNotIn("'input'", self.adb_log())
+
+
+    # ---------- connect-only port update (0.3.26) ----------
+
+    def save_identity(self):
+        bridge.save_device(
+            self.data_dir,
+            "192.168.1.50",
+            "41234",
+            {"serial": "R5CT12345678", "model": "SM_X210"},
+        )
+
+    def test_control_page_shows_saved_address_and_connect_port_form(self):
+        self.save_identity()
+        self.server.last_reconnect = {
+            "result": "failed",
+            "reason": "connection_refused",
+            "unverified": False,
+            "at": time.time(),
+        }
+        cookie, _csrf = self.login()
+        status, page, _headers = self.req("GET", "/control", cookie)
+        text = page.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("Saved address: <b>192.168.1.50:41234</b>", text)
+        self.assertIn("Last reconnect: <b>failed: connection_refused", text)
+        self.assertIn("action='connect'", text)
+        self.assertIn("name='connect_port'", text)
+        self.assertIn("value='41234'", text)
+        self.assertIn("Connect (no pairing)", text)
+        self.assertNotIn("name='host'", text.split("action='connect'")[1].split(
+            "</form>"
+        )[0])
+
+    def test_connect_new_port_saves_when_identity_matches(self):
+        self.save_identity()
+        os.environ["FAKE_ADB_SERIAL"] = "192.168.1.50:45635"
+        os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT12345678"
+        os.environ["FAKE_ADB_MODEL"] = "SM_X210"
+        cookie, csrf = self.login()
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _body, headers = self.ctl(
+                "/connect", {"connect_port": "45635"}, cookie, csrf
+            )
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            headers["Location"],
+            self.UI_PREFIX + "/control?flash=port_connected",
+        )
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["connect_port"], "45635")
+        self.assertEqual(info["serial"], "R5CT12345678")
+        self.assertEqual(info["model"], "SM_X210")
+        log = self.adb_log()
+        self.assertIn("['connect', '192.168.1.50:45635']", log)
+        self.assertNotIn("'pair'", log)
+        self.assertIn("connect_port updated", capture.getvalue())
+
+    def test_connect_new_port_refused_when_serial_mismatches(self):
+        self.save_identity()
+        os.environ["FAKE_ADB_SERIAL"] = "192.168.1.50:45635"
+        os.environ["FAKE_ADB_HW_SERIAL"] = "DIFFERENT999"
+        cookie, csrf = self.login()
+        status, _body, headers = self.ctl(
+            "/connect", {"connect_port": "45635"}, cookie, csrf
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            headers["Location"],
+            self.UI_PREFIX + "/control?flash=connect_identity_mismatch",
+        )
+        info = bridge.load_device(self.data_dir)
+        self.assertEqual(info["connect_port"], "41234")
+        self.assertEqual(info["serial"], "R5CT12345678")
+        log = self.adb_log()
+        self.assertIn("['disconnect', '192.168.1.50:45635']", log)
+        self.assertNotIn("'pair'", log)
+
+    def test_connect_new_port_rejects_invalid_port(self):
+        self.save_identity()
+        cookie, csrf = self.login()
+        status, _body, headers = self.ctl(
+            "/connect", {"connect_port": "70000"}, cookie, csrf
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            headers["Location"],
+            self.UI_PREFIX + "/control?flash=connect_invalid_port",
+        )
+        self.assertEqual(
+            bridge.load_device(self.data_dir)["connect_port"], "41234"
+        )
+        self.assertNotIn("'connect'", self.adb_log())
+
+    def test_connect_bearer_is_refused_without_session(self):
+        self.save_identity()
+        status, _body, _headers = self.req(
+            "POST",
+            "/connect",
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                **self.bearer(),
+            },
+            urllib.parse.urlencode({"connect_port": "45635"}).encode(),
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(
+            bridge.load_device(self.data_dir)["connect_port"], "41234"
+        )
+        self.assertNotIn("'connect'", self.adb_log())
+
+    def test_resolve_new_port_with_wrong_serial_is_refused(self):
+        self.save_identity()
+        os.environ["FAKE_ADB_SERIAL"] = "192.168.1.50:45635"
+        os.environ["FAKE_ADB_HW_SERIAL"] = "DIFFERENT999"
+        self.server.reconnector._last_attempt = time.monotonic()
+        status, body, _headers = self.req("GET", "/status", self.bearer())
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["connected"])
+
+    def test_resolve_new_port_with_correct_serial_is_allowed_and_cached(self):
+        self.save_identity()
+        os.environ["FAKE_ADB_SERIAL"] = "192.168.1.50:45635"
+        os.environ["FAKE_ADB_HW_SERIAL"] = "R5CT12345678"
+        self.server.reconnector._last_attempt = time.monotonic()
+        status, body, _headers = self.req("GET", "/status", self.bearer())
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["connected"])
+        reads = self.adb_log().count("ro.serialno")
+        self.assertEqual(reads, 1)
+        status, body, _headers = self.req("GET", "/status", self.bearer())
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["connected"])
+        self.assertEqual(self.adb_log().count("ro.serialno"), reads)
 
 
 if __name__ == "__main__":

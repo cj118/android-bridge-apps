@@ -1,5 +1,31 @@
 # Android Bridge changelog
 
+## 0.3.26
+
+- New `Connect (no pairing)` form under `Connect saved tablet`. The host is the
+  saved host and is not editable; only the connect port is entered, pre-filled
+  with the saved port. It posts to the existing `/connect` behind the HA-user
+  session and CSRF token, and a bearer token is still refused.
+- The handler validates the port (1-65535), connects `saved_host:port`, requires
+  exactly one transport for that host on that port, then reads `ro.serialno` and
+  the model and requires them to match the saved identity before writing. On
+  success the new port is saved atomically and the saved serial and model are
+  left unchanged. On any failure the transport is disconnected and nothing is
+  written.
+- Log lines are fixed: `connect_port updated` on success, and
+  `connect_failed reason=<category>` on failure. Flash messages name the reason
+  (`invalid_port`, `connection_refused`, `identity_mismatch`, ...).
+- Identity hardening: resolving a transport for the saved host now verifies
+  `ro.serialno` when the transport port differs from the saved port, and before
+  every screenshot, tap, swipe or text proposal. A mismatch is refused as
+  `identity_mismatch`. The verified serial is cached per transport for 60 s.
+- The control page shows the saved address (`host:port`) and the last reconnect
+  result.
+- No change to approvals, tap, swipe, text, STOP, notifications, pairing, the
+  tool allowlist or any other security behaviour.
+- Wireless ADB port discovery via mDNS is not added: the image's adb has no
+  mDNS service, and the network mode is unchanged.
+
 ## 0.3.25
 
 - Friendly app names for the approval-card headline: `com.android.settings.intelligence`

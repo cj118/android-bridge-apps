@@ -51,6 +51,7 @@ class Reconnector:
         cooldown=LAZY_COOLDOWN_SECONDS,
         sleep=time.sleep,
         log=None,
+        on_result=None,
     ):
         self.attempts = max(1, int(attempts))
         self.backoff = tuple(float(value) for value in backoff)
@@ -58,6 +59,7 @@ class Reconnector:
         self.cooldown = float(cooldown)
         self._sleep = sleep
         self._log = log or (lambda line: sys.stderr.write(line))
+        self._on_result = on_result
         self._lock = threading.Lock()
         self._last_attempt = None
 
@@ -68,6 +70,8 @@ class Reconnector:
                 self._log("adb reconnect identity unverified\n")
         else:
             self._log("adb reconnect failed reason=%s\n" % reason)
+        if self._on_result is not None:
+            self._on_result(reason, unverified)
 
     def _backoff_for(self, index):
         if not self.backoff:

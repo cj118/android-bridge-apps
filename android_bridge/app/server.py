@@ -90,6 +90,20 @@ _FLASH_MESSAGES = {
     "pair_failed": "Pairing failed. Check the IP, ports and code.",
     "disconnected": "Tablet disconnected.",
     "reconnected": "Connected to the saved tablet.",
+    "port_connected": "Connected on new port.",
+    "connect_invalid_port": "invalid_port - nothing was changed.",
+    "connect_connection_refused": (
+        "connection_refused - nothing was changed."
+    ),
+    "connect_identity_mismatch": "identity_mismatch - nothing was changed.",
+    "connect_identity_unverified": (
+        "identity_unverified - nothing was changed."
+    ),
+    "connect_device_not_paired": "device_not_paired - nothing was changed.",
+    "connect_device_not_connected": (
+        "device_not_connected - nothing was changed."
+    ),
+    "connect_failed": "connect_failed - nothing was changed.",
     "reconnect_failed": (
         "Could not verify the saved tablet. Nothing was changed."
     ),
@@ -763,20 +777,65 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return matches[0]
 
-    def _resolve_device(self):
+    IDENTITY_CACHE_SECONDS = 60.0
+
+    @staticmethod
+    def _transport_port(serial):
+        """The port of an adb host:port transport, or "" when absent."""
+        _head, _sep, tail = (serial or "").rpartition(":")
+        return tail if tail.isdigit() else ""
+
+    def _identity_ok(self, device, info):
+        """Return (verified, hardware_serial) for one saved transport.
+
+        The hardware serial is read once and cached per transport for 60 s.
+        A saved hardware serial must match exactly. A legacy record without a
+        hardware serial falls back to the saved model, exactly as reconnect
+        does, but the real serial is still read and returned.
+        """
+        transport = device.get("serial") or ""
+        saved_serial = (info.get("serial") or "").strip()
+        now = time.monotonic()
+        cached = self.server.verified_transports.get(transport)
+        if cached and now - cached[1] <= self.IDENTITY_CACHE_SECONDS:
+            actual_serial = cached[0]
+        else:
+            try:
+                actual_serial = adbctl.get_hardware_serial(transport)
+            except adbctl.AdbError:
+                self.server.verified_transports.pop(transport, None)
+                return False, ""
+            self.server.verified_transports[transport] = (actual_serial, now)
+        if adbctl.is_hardware_serial(saved_serial):
+            return actual_serial == saved_serial, actual_serial
+        saved_model = info.get("model") or reconnect_module.LEGACY_UNVERIFIED_MODEL
+        return same_model(device.get("model", ""), saved_model), actual_serial
+
+    def _resolve_device(self, require_identity=False):
+        """Return (info, device, error); identity is checked when needed."""
         info = load_device(self.server.data_dir)
         if not info:
-            return info, None
-        return info, self._resolve_target(info["host"])
+            return info, None, None
+        device = self._resolve_target(info["host"])
+        if device is None:
+            return info, None, None
+        port_changed = (
+            self._transport_port(device["serial"]) != info.get("connect_port")
+        )
+        if require_identity or port_changed:
+            verified, _serial = self._identity_ok(device, info)
+            if not verified:
+                return info, None, "identity_mismatch"
+        return info, device, None
 
-    def _resolve_after_reconnect(self):
+    def _resolve_after_reconnect(self, require_identity=False):
         """Resolve the device, trying one bounded reconnect if it is absent."""
-        info, device = self._resolve_device()
+        info, device, error = self._resolve_device(require_identity)
         if device is not None or not info:
-            return info, device
+            return info, device, error
         if self.server.reconnector.lazy(info):
-            return self._resolve_device()
-        return info, None
+            return self._resolve_device(require_identity)
+        return info, None, error
 
     # ---------- GET ----------
 
@@ -832,7 +891,9 @@ class Handler(BaseHTTPRequestHandler):
             device = None
             if info:
                 try:
-                    _info, device = self._resolve_after_reconnect()
+                    _info, device, _identity_error = (
+                        self._resolve_after_reconnect()
+                    )
                 except adbctl.AdbError:
                     device = None
             self._send_json(
@@ -919,10 +980,12 @@ class Handler(BaseHTTPRequestHandler):
             info = load_device(self.server.data_dir)
             if not info:
                 return None, "device_not_paired", None
-            _info, device = self._resolve_after_reconnect()
+            _info, device, identity_error = self._resolve_after_reconnect(
+                require_identity=True
+            )
             if device is None:
                 self._end_sessions()
-                return None, "device_not_connected", None
+                return None, identity_error or "device_not_connected", None
 
             try:
                 data = adbctl.screencap(device["serial"], timeout=20.0)
@@ -1199,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if name == "android_status":
             info = load_device(self.server.data_dir)
-            _info, device = self._resolve_after_reconnect()
+            _info, device, _identity_error = self._resolve_after_reconnect()
             payload = {
                 "paired": bool(info),
                 "connected": device is not None,
@@ -1260,9 +1323,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _mcp_ui_elements(self, message_id):
         """Read-only target list. Viewing is enforced by the tools/call gate."""
-        _info, device = self._resolve_after_reconnect()
+        _info, device, identity_error = self._resolve_after_reconnect()
         if device is None:
-            self._mcp_error(message_id, "device_not_connected")
+            self._mcp_error(message_id, identity_error or "device_not_connected")
             return
         try:
             xml = adbctl.ui_dump(device["serial"])
@@ -2161,7 +2224,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond({"error": "approval cancelled"}, 409, flash="error")
                 return
 
-            _info, device = self._resolve_device()
+            _info, device, _identity_error = self._resolve_device()
             if device is None:
                 self.server.approvals.fail(key, "device_unavailable")
                 self._end_sessions()
@@ -2863,19 +2926,50 @@ class Handler(BaseHTTPRequestHandler):
                 left = max(0, int(expires - now))
                 control = "ON (%dm %02ds)" % (left // 60, left % 60)
         saved = load_device(self.server.data_dir)
+        last = getattr(self.server, "last_reconnect", None)
+        if last:
+            when = time.strftime("%H:%M:%S", time.localtime(last.get("at", 0)))
+            if last.get("result") == "ok":
+                last_text = "ok%s at %s" % (
+                    " (identity unverified)" if last.get("unverified") else "",
+                    when,
+                )
+            else:
+                last_text = "failed: %s at %s" % (
+                    last.get("reason") or "unknown",
+                    when,
+                )
+        else:
+            last_text = "not attempted yet"
         if saved:
             saved_form = (
+                "<p>Saved address: <b>%s:%s</b></p>"
+                "<p>Last reconnect: <b>%s</b></p>"
                 "<form method='post' action='control/reconnect' style='margin-top:.5rem'>"
                 "<input type='hidden' name='csrf' value='%s'>"
                 "<button>Connect saved tablet (%s:%s)</button></form>"
+                "<form method='post' action='connect' style='margin-top:.5rem'>"
+                "<input type='hidden' name='csrf' value='%s'>"
+                "<label>Connect port "
+                "<input type='number' name='connect_port' min='1' max='65535' "
+                "value='%s' required style='width:7rem'></label> "
+                "<button>Connect (no pairing)</button></form>"
                 % (
+                    html.escape(saved["host"], quote=True),
+                    html.escape(saved["connect_port"], quote=True),
+                    html.escape(last_text, quote=True),
                     csrf_attr,
                     html.escape(saved["host"], quote=True),
+                    html.escape(saved["connect_port"], quote=True),
+                    csrf_attr,
                     html.escape(saved["connect_port"], quote=True),
                 )
             )
         else:
-            saved_form = "<p>No saved tablet.</p>"
+            saved_form = (
+                "<p>No saved tablet.</p><p>Last reconnect: <b>%s</b></p>"
+                % html.escape(last_text, quote=True)
+            )
         body = (
             "<html><head><meta charset='utf-8'>"
             "<title>Android Bridge control</title>%s</head>"
@@ -2958,31 +3052,102 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._respond({"status": "paired"}, flash="paired")
 
+    def _record_and_flash_connect(self, reason, status):
+        """Record a failed connect-only attempt and flash its reason."""
+        _record_reconnect(self.server, reason)
+        sys.stderr.write("connect_failed reason=%s\n" % reason)
+        flash = "connect_" + reason
+        if flash not in _FLASH_MESSAGES:
+            flash = "connect_failed"
+        self._respond({"error": reason}, status, flash=flash)
+
+    def _disconnect_host(self, host):
+        """Best-effort disconnect of every transport for one host."""
+        try:
+            devices = adbctl.list_devices()
+        except adbctl.AdbError:
+            return
+        for device in devices:
+            if device["serial"].startswith(host + ":"):
+                try:
+                    adbctl.disconnect(device["serial"])
+                except adbctl.AdbError:
+                    pass
+
     def _do_connect(self, fields):
-        host = (fields.get("host") or "").strip()
+        """Connect the saved host on a new port; never pairs."""
+        info = load_device(self.server.data_dir)
+        if not info:
+            self._record_and_flash_connect("device_not_paired", 409)
+            return
+        host = info["host"]
         port = (fields.get("connect_port") or "").strip()
         try:
             adbctl.validate_target(host, port)
+        except adbctl.AdbError:
+            self._record_and_flash_connect("invalid_port", 400)
+            return
+        try:
             adbctl.connect(host, port)
         except adbctl.AdbError as exc:
-            sys.stderr.write(
-                "connect_failed reason=%s\n" % (exc.reason or "unknown")
+            self._record_and_flash_connect(
+                exc.reason or "connection_refused", 400
             )
-            self._respond({"error": "connect_failed"}, 400, flash="pair_failed")
             return
         device = self._resolve_target(host)
-        identity = capture_identity(device) if device is not None else None
+        if device is None or self._transport_port(device["serial"]) != port:
+            self._disconnect_host(host)
+            self._record_and_flash_connect("device_not_connected", 409)
+            return
+        try:
+            actual_serial = adbctl.get_hardware_serial(device["serial"])
+            actual_model = adbctl.get_model(device["serial"])
+        except adbctl.AdbError:
+            self._disconnect_host(host)
+            self._record_and_flash_connect("identity_unverified", 409)
+            return
+        saved_serial = (info.get("serial") or "").strip()
+        saved_model = info.get("model") or ""
+        mismatch = False
+        if adbctl.is_hardware_serial(saved_serial):
+            mismatch = actual_serial != saved_serial
+        elif not same_model(
+            actual_model,
+            saved_model or reconnect_module.LEGACY_UNVERIFIED_MODEL,
+        ):
+            mismatch = True
+        if saved_model and not same_model(actual_model, saved_model):
+            mismatch = True
+        if mismatch:
+            self._disconnect_host(host)
+            self._record_and_flash_connect("identity_mismatch", 409)
+            return
+        identity = {
+            "serial": saved_serial or actual_serial,
+            "model": saved_model or actual_model,
+        }
         try:
             save_device(self.server.data_dir, host, port, identity)
         except OSError:
+            self._disconnect_host(host)
             self._send_json(500, {"error": "state_write_failed"})
             return
-        self._send_json(200, {"status": "connected"})
+        self.server.verified_transports[device["serial"]] = (
+            actual_serial,
+            time.monotonic(),
+        )
+        _record_reconnect(self.server, None)
+        sys.stderr.write("connect_port updated\n")
+        self._respond(
+            {"status": "connected", "connect_port": port},
+            flash="port_connected",
+        )
 
     def _do_connect_saved(self):
         """Reconnect to the saved tablet without pairing, then verify it."""
         info = load_device(self.server.data_dir)
         if not info:
+            _record_reconnect(self.server, "device_not_paired")
             self._respond(
                 {"error": "device_not_paired"}, 409, flash="reconnect_failed"
             )
@@ -2993,6 +3158,9 @@ class Handler(BaseHTTPRequestHandler):
             adbctl.validate_target(host, port)
             adbctl.connect(host, port)
         except adbctl.AdbError as exc:
+            _record_reconnect(
+                self.server, exc.reason or "connection_refused"
+            )
             sys.stderr.write(
                 "saved_connect_failed reason=%s\n" % (exc.reason or "unknown")
             )
@@ -3022,6 +3190,7 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 error = "identity_unverified"
         if error is not None:
+            _record_reconnect(self.server, error)
             # Other paths match the saved target by host, so an unverified
             # tablet must not stay connected.
             if device is not None:
@@ -3040,6 +3209,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self._send_json(500, {"error": "state_write_failed"})
                 return
+        _record_reconnect(self.server, None)
         self._respond({"status": "connected"}, flash="reconnected")
 
     def _do_disconnect(self):
@@ -3101,6 +3271,16 @@ class BridgeServer(ThreadingHTTPServer):
             self._slots.release()
 
 
+def _record_reconnect(server, reason, unverified=False):
+    """Remember the last reconnect result for the control page."""
+    server.last_reconnect = {
+        "result": "ok" if reason is None else "failed",
+        "reason": "" if reason is None else str(reason),
+        "unverified": bool(unverified),
+        "at": time.time(),
+    }
+
+
 def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     token = load_or_create_token(data_dir)
     server = BridgeServer((host, port), Handler)
@@ -3123,7 +3303,13 @@ def create_server(host="0.0.0.0", port=PORT, data_dir=DEFAULT_DATA_DIR):
     server.control_lock = threading.RLock()
     server.first_tap_test = FIRST_TAP_TEST_MODE
     server.approvals = control_actions.Approvals()
-    server.reconnector = reconnect_module.Reconnector()
+    server.verified_transports = {}
+    server.last_reconnect = None
+    server.reconnector = reconnect_module.Reconnector(
+        on_result=lambda reason, unverified: _record_reconnect(
+            server, reason, unverified
+        )
+    )
     server.started_monotonic = time.monotonic()
     return server
 

@@ -51,6 +51,9 @@ if len(args) > 3 and args[2] == "exec-out" and args[3] == "cat":
     with open(path, "rb") as fh:
         sys.stdout.buffer.write(fh.read())
     sys.exit(0)
+if "-s" in args and "shell" in args and args[-1] == "ro.serialno":
+    print("R5CT12345678")
+    sys.exit(0)
 if "-s" in args and "exec-out" in args:
     with open(os.environ["FAKE_ADB_PNG"], "rb") as fh:
         sys.stdout.buffer.write(fh.read())

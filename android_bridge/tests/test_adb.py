@@ -33,7 +33,13 @@ mode = os.environ.get("FAKE_ADB_MODE", "ok")
 if args and args[0] == "start-server":
     print("* daemon started successfully")
     sys.exit(0)
-if "shell" in args:
+if "-s" in args and "shell" in args:
+    if args[-1] == "ro.serialno":
+        print("R5CT12345678")
+        sys.exit(0)
+    if args[-1] == "ro.product.model":
+        print("SM_X210")
+        sys.exit(0)
     sys.exit(9)
 if args and args[0] == "version":
     print("Android Debug Bridge version 1.0.41")
@@ -212,12 +218,15 @@ class ScreenshotTests(unittest.TestCase):
         self.assertEqual(status, 429)
         self.assertIn(b"capture_busy", body)
 
-    def test_no_shell_command_is_ever_invoked(self):
+    def test_only_fixed_identity_shell_reads_are_invoked(self):
         self.request("GET", "/screenshot", self.auth())
         with open(self.log_path, "r", encoding="utf-8") as handle:
             invocations = handle.read()
-        self.assertNotIn("'shell'", invocations)
+        self.assertNotIn("'input'", invocations)
         self.assertNotIn("'exec'", invocations)
+        for line in invocations.splitlines():
+            if "'shell'" in line:
+                self.assertIn("'getprop', 'ro.serialno'", line)
 
     def test_status_reports_connection(self):
         status, body, _ = self.request("GET", "/status", self.auth())
