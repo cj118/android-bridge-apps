@@ -1,5 +1,22 @@
 # Android Bridge changelog
 
+## 0.3.28
+
+- `android_screenshot` accepts two read-only options. `grid` draws lines every
+  100 device px, bolder and larger-labelled every 200 px, labelled in device
+  coordinates with a high-contrast band and label background. `region`
+  returns a full-resolution crop of a validated device-pixel area with the
+  same device-coordinate grid. Every screenshot result now also includes the
+  device width and height and a note that the image may be downscaled and only
+  device coordinates may be used for taps.
+- The tap approval card now shows `Target NOT verified - check the marker
+  carefully` plus a full-resolution zoom around the tap point with a
+  crosshair-and-ring marker when no clickable element is found. The existing
+  full screenshot and overlay are unchanged.
+- Grid, region and the zoom are read-only. Approvals, STOP, identity checks,
+  swipe edge rules, the tool allowlist and the MCP gates are unchanged.
+- New test asserts `config.yaml` version equals `server.VERSION`.
+
 ## 0.3.27
 
 - Version-label correction. The application `VERSION` constant still said

@@ -24,12 +24,13 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import adbctl
+import annotate
 import control as control_actions
 import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.27"
+VERSION = "0.3.28"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -1018,6 +1019,102 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_png(data)
 
+    @staticmethod
+    def _region_bounds(region, width, height):
+        """Validate a device-pixel region and return (x, y, width, height)."""
+        if not isinstance(region, dict):
+            raise ValueError("invalid region")
+        values = []
+        for key in ("x", "y", "width", "height"):
+            value = region.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("invalid region")
+            values.append(value)
+        x, y, region_width, region_height = values
+        if x < 0 or y < 0 or region_width < 1 or region_height < 1:
+            raise ValueError("invalid region")
+        if x + region_width > width or y + region_height > height:
+            raise ValueError("invalid region")
+        return x, y, region_width, region_height
+
+    def _mcp_screenshot(self, params, message_id):
+        """Screenshot with optional device-coordinate grid and region crop."""
+        data, error, _device = self._capture_frame()
+        if error is not None:
+            self._mcp_error(message_id, error)
+            return
+        try:
+            device_width, device_height = pngcheck.validate(
+                data, max_bytes=MAX_CAPTURE_BYTES
+            )
+        except pngcheck.PngError:
+            self._mcp_error(message_id, "invalid_image")
+            return
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        grid = arguments.get("grid") is True
+        region = arguments.get("region")
+        bounds = None
+        payload = data
+        try:
+            if region is not None:
+                bounds = self._region_bounds(
+                    region, device_width, device_height
+                )
+            if region is not None or grid:
+                image = pngcheck.decode(
+                    data, max_bytes=MAX_CAPTURE_BYTES
+                )
+                if region is not None:
+                    payload = annotate.region_png(image, *bounds)
+                else:
+                    payload = annotate.grid_png(
+                        image, device_width, device_height
+                    )
+        except pngcheck.PngError:
+            self._mcp_error(message_id, "invalid_image")
+            return
+        except ValueError:
+            self._mcp_error(message_id, "invalid_region")
+            return
+        except Exception:
+            self._mcp_error(message_id, "annotation_failed")
+            return
+        meta = {
+            "width": device_width,
+            "height": device_height,
+            "image_width": bounds[2] if bounds else device_width,
+            "image_height": bounds[3] if bounds else device_height,
+            "grid": bool(grid or bounds),
+            "note": (
+                "The returned image may be downscaled. Use only DEVICE "
+                "coordinates for taps, swipes and text targets; grid labels "
+                "are device pixels."
+            ),
+        }
+        if bounds:
+            meta["region"] = {
+                "x": bounds[0],
+                "y": bounds[1],
+                "width": bounds[2],
+                "height": bounds[3],
+            }
+        result = {
+            "content": [
+                {
+                    "type": "image",
+                    "data": base64.b64encode(payload).decode("ascii"),
+                    "mimeType": "image/png",
+                },
+                {"type": "text", "text": json.dumps(meta)},
+            ],
+            "isError": False,
+        }
+        self._send_json(
+            200, {"jsonrpc": "2.0", "id": message_id, "result": result}
+        )
+
     # ---------- MCP (read-only tools) ----------
 
     MCP_TOOLS = [
@@ -1025,11 +1122,36 @@ class Handler(BaseHTTPRequestHandler):
             "name": "android_screenshot",
             "description": (
                 "Capture the connected Android tablet screen once and return it "
-                "as a PNG image. Read-only; no input is sent to the device."
+                "as a PNG image plus device width/height. Optional grid draws "
+                "100 device-px lines with device-coordinate labels (major every "
+                "200 px); optional region returns a full-resolution crop. "
+                "Read-only; no input is sent to the device."
             ),
             "inputSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "grid": {
+                        "type": "boolean",
+                        "description": (
+                            "Draw a coordinate grid labelled in device pixels."
+                        ),
+                    },
+                    "region": {
+                        "type": "object",
+                        "description": (
+                            "Full-resolution crop in device pixels, labelled "
+                            "with device coordinates."
+                        ),
+                        "properties": {
+                            "x": {"type": "integer", "minimum": 0},
+                            "y": {"type": "integer", "minimum": 0},
+                            "width": {"type": "integer", "minimum": 1},
+                            "height": {"type": "integer", "minimum": 1},
+                        },
+                        "required": ["x", "y", "width", "height"],
+                        "additionalProperties": False,
+                    },
+                },
                 "additionalProperties": False,
             },
         },
@@ -1276,24 +1398,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if name == "android_screenshot":
-            data, error = self._capture_bytes()
-            if error is not None:
-                result = {
-                    "content": [{"type": "text", "text": error}],
-                    "isError": True,
-                }
-            else:
-                result = {
-                    "content": [
-                        {
-                            "type": "image",
-                            "data": base64.b64encode(data).decode("ascii"),
-                            "mimeType": "image/png",
-                        }
-                    ],
-                    "isError": False,
-                }
-            self._send_json(200, {"jsonrpc": "2.0", "id": message_id, "result": result})
+            self._mcp_screenshot(params, message_id)
             return
 
         if name == "android_ui_elements":
@@ -2521,6 +2626,25 @@ class Handler(BaseHTTPRequestHandler):
         )
         return circle + self._crosshair_html(x, y, width, height)
 
+    def _tap_zoom_html(self, record, x, y):
+        """Full-resolution crop around an unverified tap, with the marker."""
+        try:
+            image = pngcheck.decode(
+                record["preshot"], max_bytes=MAX_CAPTURE_BYTES
+            )
+            data = annotate.marker_crop(image, x, y, size=320)
+        except (pngcheck.PngError, ValueError, KeyError):
+            return ""
+        encoded = base64.b64encode(data).decode("ascii")
+        return (
+            "<p style='margin:.75rem 0 .25rem;color:#ff8080'>"
+            "<b>Zoom around the tap (X=%d, Y=%d device px)</b></p>"
+            "<img src='data:image/png;base64,%s' "
+            "style='display:block;width:100%%;max-width:32rem;"
+            "border:1px solid #555;image-rendering:pixelated'>"
+            % (x, y, encoded)
+        )
+
     def _result_label(self, record):
         state = record["state"]
         detail = record.get("detail", "")
@@ -2834,6 +2958,7 @@ class Handler(BaseHTTPRequestHandler):
             remaining = control_actions.format_remaining(record["expires"] - now)
             tap_line = ""
             overlay = ""
+            zoom_html = ""
             if action.get("type") == "swipe":
                 cards.append(
                     self._swipe_card_html(record, image, remaining, csrf_attr)
@@ -2861,9 +2986,9 @@ class Handler(BaseHTTPRequestHandler):
                     warning = "Warning: this will press a button"
                 else:
                     warning = (
-                        "Warning: no clickable element detected — this area "
-                        "may still contain interactive controls."
+                        "Target NOT verified - check the marker carefully"
                     )
+                    zoom_html = self._tap_zoom_html(record, x, y)
                 headline += (
                     "<p style='font-size:1.2rem;font-weight:700;"
                     "color:#ff2020;margin:0 0 .75rem'>%s</p>" % warning
@@ -2884,6 +3009,7 @@ class Handler(BaseHTTPRequestHandler):
                 "<img src='data:image/png;base64,%s' "
                 "style='display:block;width:100%%;max-width:100%%;height:auto'>"
                 "%s</div>"
+                "%s"
                 "<p><b>AI reason:</b> %s</p>"
                 "%s"
                 "<p><b>Screen:</b> %d × %d — %s</p>"
@@ -2903,6 +3029,7 @@ class Handler(BaseHTTPRequestHandler):
                     headline,
                     image,
                     overlay,
+                    zoom_html,
                     reason,
                     tap_line,
                     width,

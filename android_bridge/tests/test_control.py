@@ -25,6 +25,7 @@ sys.path.insert(0, APP_DIR)
 import server as bridge  # noqa: E402
 import adbctl  # noqa: E402
 import control as control_actions  # noqa: E402
+import pngcheck  # noqa: E402
 
 FAKE_ADB = r'''#!/usr/bin/env python3
 import os, sys, time
@@ -2432,9 +2433,7 @@ class ControlSecurityTests(unittest.TestCase):
         )
         self.assertNotIn("Warning: this will press a button", text)
         self.assertIn(
-            "Warning: no clickable element detected — this area may still "
-            "contain interactive controls.",
-            text,
+            "Target NOT verified - check the marker carefully", text
         )
         self.assertNotIn("No button here", text)
 
@@ -2447,7 +2446,7 @@ class ControlSecurityTests(unittest.TestCase):
         text = page.decode("utf-8")
         self.assertIn("This will tap: Unknown — could not check.", text)
         self.assertIn(
-            "may still contain interactive controls", text
+            "Target NOT verified - check the marker carefully", text
         )
 
     def test_card_order_target_warning_screenshot_reason_buttons(self):
@@ -3370,8 +3369,8 @@ class ControlSecurityTests(unittest.TestCase):
     def test_text_version_is_bumped(self):
         config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
         with open(config_path, encoding="utf-8") as handle:
-            self.assertIn('version: "0.3.27"', handle.read())
-        self.assertEqual(bridge.VERSION, "0.3.27")
+            self.assertIn('version: "0.3.28"', handle.read())
+        self.assertEqual(bridge.VERSION, "0.3.28")
 
     # ---------- app labels (0.3.25) ----------
 
@@ -3691,6 +3690,101 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["connected"])
         self.assertEqual(self.adb_log().count("ro.serialno"), reads)
+
+
+    # ---------- screenshot grid, region and tap zoom (0.3.28) ----------
+
+    def screenshot(self, arguments):
+        return self.mcp({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "android_screenshot",
+                "arguments": arguments,
+            },
+        })
+
+    def test_config_version_matches_server_version(self):
+        config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
+        with open(config_path, encoding="utf-8") as handle:
+            match = re.search(
+                r'^version: "([^"]+)"$', handle.read(), re.MULTILINE
+            )
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), bridge.VERSION)
+
+    def test_screenshot_grid_has_device_metadata_and_pixels(self):
+        self.start_control()
+        status, payload = self.screenshot({"grid": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["result"]["isError"])
+        image_content, text_content = payload["result"]["content"]
+        self.assertEqual(image_content["type"], "image")
+        meta = json.loads(text_content["text"])
+        self.assertEqual((meta["width"], meta["height"]), (1920, 1200))
+        self.assertTrue(meta["grid"])
+        self.assertIn("downscaled", meta["note"])
+        self.assertIn("DEVICE", meta["note"])
+        image = pngcheck.decode(base64.b64decode(image_content["data"]))
+        self.assertEqual((image.width, image.height), (1920, 1200))
+        index = (600 * image.width + 100) * 4
+        red, green, blue = image.rows[index:index + 3]
+        self.assertGreater(red, 200)
+        self.assertGreater(green, 150)
+        self.assertLess(blue, 120)
+
+    def test_screenshot_region_returns_full_resolution_crop(self):
+        self.start_control()
+        region = {"x": 400, "y": 300, "width": 320, "height": 200}
+        status, payload = self.screenshot({"region": region})
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["result"]["isError"])
+        image_content, text_content = payload["result"]["content"]
+        meta = json.loads(text_content["text"])
+        self.assertEqual(meta["region"], region)
+        self.assertEqual(
+            (meta["image_width"], meta["image_height"]), (320, 200)
+        )
+        self.assertTrue(meta["grid"])
+        image = pngcheck.decode(base64.b64decode(image_content["data"]))
+        self.assertEqual((image.width, image.height), (320, 200))
+
+    def test_screenshot_region_out_of_bounds_is_refused(self):
+        self.start_control()
+        status, payload = self.screenshot({
+            "region": {"x": 1900, "y": 0, "width": 100, "height": 100},
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["result"]["isError"])
+        self.assertEqual(
+            payload["result"]["content"][0]["text"], "invalid_region"
+        )
+
+    def test_screenshot_without_options_reports_device_size(self):
+        self.start_control()
+        status, payload = self.screenshot({})
+        self.assertFalse(payload["result"]["isError"])
+        content = payload["result"]["content"]
+        self.assertEqual(content[0]["type"], "image")
+        meta = json.loads(content[1]["text"])
+        self.assertEqual((meta["width"], meta["height"]), (1920, 1200))
+        self.assertFalse(meta["grid"])
+
+    def test_unverified_tap_card_warns_and_shows_zoom(self):
+        self.start_control()
+        self.set_ui_dump(UI_DUMP_BLANK)
+        self.new_proposal()
+        cookie, _csrf = self.login()
+        status, page, _headers = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        text = page.decode("utf-8")
+        self.assertIn(
+            "Target NOT verified - check the marker carefully", text
+        )
+        self.assertGreaterEqual(
+            text.count("data:image/png;base64,"), 2
+        )
 
 
 if __name__ == "__main__":
