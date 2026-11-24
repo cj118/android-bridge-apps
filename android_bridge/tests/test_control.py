@@ -72,6 +72,14 @@ if "-s" in args and "getprop" in args:
     else:
         print(os.environ.get("FAKE_ADB_MODEL", "SM_X210"))
     sys.exit(0)
+if len(args) > 5 and args[2:5] == ["shell", "dumpsys", "window"]:
+    if os.environ.get("FAKE_ADB_WINDOWS") == "fail":
+        sys.exit(1)
+    print(os.environ.get(
+        "FAKE_ADB_WINDOWS",
+        os.environ.get("FAKE_ADB_FOREGROUND", ""),
+    ))
+    sys.exit(0)
 if len(args) > 4 and args[2:4] == ["shell", "dumpsys"]:
     print(os.environ.get(
         "FAKE_ADB_FOREGROUND",
@@ -244,6 +252,33 @@ UI_DUMP_ESCAPE = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 """
 
 
+WINDOWS_NO_FLOAT = """  Window #0 Window{aaa u0 com.android.settings/com.android.settings.Settings}:
+    mAttrs={(0,0)(fillxfill) ty=APPLICATION}
+    mFrame=[0,0][1920,1200] last=[0,0][1920,1200]
+    isOnScreen=true
+  Window #1 Window{bbb u0 com.android.systemui/StatusBar}:
+    mAttrs={(0,0)(fillxfill) ty=STATUS_BAR}
+    mFrame=[0,0][1920,48]
+    isOnScreen=true
+"""
+
+# A YouTube picture-in-picture window over the same point the UI dump reports
+# as the "Living Room TV" button at [400,700][700,860].
+WINDOWS_YOUTUBE_PIP = """  Window #0 Window{ccc u0 com.google.android.youtube/com.google.android.apps.youtube.app.watchwhile.MainActivity}:
+    mAttrs={(0,0)(fillxfill) ty=APPLICATION}
+    mFrame=[400,700][700,860]
+    isOnScreen=true
+  Window #1 Window{aaa u0 com.android.settings/com.android.settings.Settings}:
+    mAttrs={(0,0)(fillxfill) ty=APPLICATION}
+    mFrame=[0,0][1920,1200] last=[0,0][1920,1200]
+    isOnScreen=true
+  Window #2 Window{bbb u0 com.android.systemui/StatusBar}:
+    mAttrs={(0,0)(fillxfill) ty=STATUS_BAR}
+    mFrame=[0,0][1920,48]
+    isOnScreen=true
+"""
+
+
 def _png_chunk(kind, payload):
     return (
         struct.pack(">I", len(payload))
@@ -386,6 +421,7 @@ class ControlSecurityTests(unittest.TestCase):
         os.environ["FAKE_ADB_SCREENCAP_COUNTER"] = self.screen_counter
         os.environ.pop("FAKE_ADB_UI_DUMP", None)
         os.environ.pop("FAKE_ADB_INPUT_FAIL", None)
+        os.environ.pop("FAKE_ADB_WINDOWS", None)
         # A stable identified target at the default proposal point (540, 780)
         # keeps the approval path exercised; tests that need an inspection
         # failure remove it explicitly.
@@ -3373,8 +3409,8 @@ class ControlSecurityTests(unittest.TestCase):
     def test_text_version_is_bumped(self):
         config_path = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
         with open(config_path, encoding="utf-8") as handle:
-            self.assertIn('version: "0.3.30"', handle.read())
-        self.assertEqual(bridge.VERSION, "0.3.30")
+            self.assertIn('version: "0.3.31"', handle.read())
+        self.assertEqual(bridge.VERSION, "0.3.31")
 
     # ---------- app labels (0.3.25) ----------
 
@@ -4006,6 +4042,455 @@ class ControlSecurityTests(unittest.TestCase):
         self.assertIn("banner banner-bad", page)
         self.assertIn("✗ Approval already used - nothing was sent", page)
         self.assertEqual(self.adb_log().count("'input'"), 1)
+
+
+    # ---------- 0.3.31: notification pages and origin binding ----------
+
+    NOTIFICATION_REFERER = (
+        "https://ha.example/api/hassio_ingress/TESTTOKEN/control"
+    )
+
+    def login_with_referer(self, origin="null", sfs=None, referer=None):
+        """Sign in like the Home Assistant notification page does."""
+        nonce, login_cookie = self.login_page()
+        headers = {
+            "Cookie": login_cookie,
+            "X-Remote-User-Name": "alice",
+            "Referer": self.NOTIFICATION_REFERER if referer is None else referer,
+        }
+        if origin is not None:
+            headers["Origin"] = origin
+        if sfs:
+            headers["Sec-Fetch-Site"] = sfs
+        status, page, response = self.form("/control", {"nonce": nonce}, headers)
+        self.assertEqual(status, 200)
+        cookie = {"Cookie": response["Set-Cookie"].split(";", 1)[0]}
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        csrf = re.search(rb"name='csrf' value='([0-9a-f]+)'", page).group(1).decode()
+        return cookie, csrf
+
+    def bound_origin(self, cookie):
+        nonce = cookie["Cookie"].split("=", 1)[1].split(".", 1)[0]
+        session = self.server.ui_sessions.get(nonce)
+        self.assertIsNotNone(session)
+        return session.get("origin")
+
+    def test_notification_signin_binds_the_referer_origin(self):
+        cookie, csrf = self.login_with_referer()
+        self.assertEqual(self.bound_origin(cookie), "https://ha.example")
+        self.ctl("/control/session", {"view": "on", "control": "on"},
+                 cookie, csrf, origin="https://ha.example", sfs="same-origin")
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "test harmlessly"}
+        )
+        key = json.loads(payload["result"]["content"][0]["text"])["approval_id"]
+        status, _, _ = self.ctl(
+            "/control/approve", {"id": key}, cookie, csrf,
+            origin="https://ha.example",
+        )
+        self.assertEqual(status, 303)
+        self.assertIn("'input'", self.adb_log())
+
+    def test_notification_signin_does_not_bind_a_cross_site_referer(self):
+        cookie, csrf = self.login_with_referer(sfs="cross-site")
+        self.assertIsNone(self.bound_origin(cookie))
+        self.server.control_active = True
+        self.server.control_expires = time.monotonic() + 600
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 600
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "test harmlessly"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        key = summary["approval_id"]
+        status, _, _ = self.ctl(
+            "/control/approve", {"id": key}, cookie, csrf,
+            origin="https://ha.example", sfs="cross-site",
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_unbound_session_binds_on_approval_when_referer_matches(self):
+        # The exact live failure: the session was created with an opaque
+        # origin, and the approval POST carries Origin plus a matching
+        # Referer. It binds once and is accepted.
+        cookie, csrf = self.login_null()
+        self.ctl("/control/session", {"view": "on", "control": "on"},
+                 cookie, csrf, origin="null", sfs="same-origin")
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "test harmlessly"}
+        )
+        key = json.loads(payload["result"]["content"][0]["text"])["approval_id"]
+        capture = io.StringIO()
+        with contextlib.redirect_stderr(capture):
+            status, _, _ = self.form(
+                "/control/approve", {"id": key, "csrf": csrf},
+                {**cookie, "Origin": "https://ha.example",
+                 "Referer": self.NOTIFICATION_REFERER},
+            )
+        self.assertEqual(status, 303)
+        self.assertIn("origin_bound source=referer", capture.getvalue())
+        self.assertIn("'input'", self.adb_log())
+        self.assertEqual(self.bound_origin(cookie), "https://ha.example")
+
+    def test_unbound_session_still_rejects_a_foreign_referer(self):
+        cookie, csrf = self.login_null()
+        self.server.control_active = True
+        self.server.control_expires = time.monotonic() + 600
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 600
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "test harmlessly"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["state"], "pending")
+        key = summary["approval_id"]
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "https://evil.example",
+             "Referer": "https://evil.example/x"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_unbound_session_bind_is_refused_for_cross_site_metadata(self):
+        cookie, csrf = self.login_null()
+        self.server.control_active = True
+        self.server.control_expires = time.monotonic() + 600
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 600
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "test harmlessly"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["state"], "pending")
+        key = summary["approval_id"]
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "https://ha.example",
+             "Referer": self.NOTIFICATION_REFERER,
+             "Sec-Fetch-Site": "cross-site"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    def test_unbound_session_bind_requires_the_ingress_peer(self):
+        cookie, csrf = self.login_null()
+        self.server.control_active = True
+        self.server.control_expires = time.monotonic() + 600
+        self.server.viewing_active = True
+        self.server.viewing_expires = time.monotonic() + 600
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "test harmlessly"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["state"], "pending")
+        key = summary["approval_id"]
+        self.set_peer("192.168.1.99")
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "https://ha.example",
+             "Referer": self.NOTIFICATION_REFERER},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    # ---------- 0.3.31: STOP always works ----------
+
+    def test_stop_is_allowed_from_a_mismatched_origin(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/stop", {"csrf": csrf},
+            {**cookie, "Origin": "https://evil.example",
+             "X-Remote-User-Name": "alice"},
+        )
+        self.assertEqual(status, 303)
+        self.assertFalse(self.server.control_active)
+        self.assertIsNone(self.server.approvals.get(key))
+
+    def test_stop_is_allowed_from_a_stale_page_without_csrf(self):
+        self.start_control()
+        self.new_proposal()
+        status, _, _ = self.form(
+            "/control/stop", {},
+            {"X-Remote-User-Name": "alice"},
+        )
+        self.assertEqual(status, 303)
+        self.assertFalse(self.server.control_active)
+        self.assertFalse(self.server.viewing_active)
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_stop_from_a_foreign_peer_is_still_denied(self):
+        self.start_control()
+        self.set_peer("192.168.1.99")
+        status, _, _ = self.form(
+            "/control/stop", {},
+            {"X-Remote-User-Name": "alice"},
+        )
+        self.assertEqual(status, 403)
+        self.assertTrue(self.server.control_active)
+
+    def test_stop_from_a_disallowed_ha_user_is_denied(self):
+        self.start_control()
+        status, _, _ = self.form(
+            "/control/stop", {},
+            {"X-Remote-User-Name": "mallory"},
+        )
+        self.assertEqual(status, 403)
+        self.assertTrue(self.server.control_active)
+
+    def test_stop_relaxation_does_not_allow_approval(self):
+        cookie, csrf = self.start_control()
+        key = self.new_proposal()
+        status, _, _ = self.form(
+            "/control/approve", {"id": key, "csrf": csrf},
+            {**cookie, "Origin": "https://evil.example",
+             "X-Remote-User-Name": "alice"},
+        )
+        self.assertEqual(status, 403)
+        self.assertNotIn("'input'", self.adb_log())
+
+    # ---------- 0.3.31: friendly out-of-date page ----------
+
+    def browser_headers(self, extra=None):
+        headers = {"Accept": "text/html,application/xhtml+xml"}
+        headers.update(extra or {})
+        return headers
+
+    def test_forbidden_control_post_returns_a_friendly_page(self):
+        cookie, csrf = self.start_control()
+        status, body, headers = self.form(
+            "/control/approve", {"id": "deadbeef", "csrf": csrf},
+            self.browser_headers({**cookie, "Origin": "https://evil.example"}),
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("text/html", headers["Content-Type"])
+        page = body.decode("utf-8")
+        self.assertIn(
+            "This page is out of date. Please reload it and try again.", page
+        )
+        parsed = RenderedPage()
+        parsed.feed(page)
+        self.assertIn("Reload the control page", parsed.visible_text)
+        actions = [
+            form["attrs"].get("action") for form in parsed.forms
+        ]
+        self.assertIn(self.UI_PREFIX + "/control/stop", actions)
+        self.assertTrue(
+            any(
+                form["attrs"].get("action") == self.UI_PREFIX + "/control"
+                for form in parsed.forms
+            )
+            or self.UI_PREFIX + "/control" in parsed.attribute_values
+        )
+
+    def test_friendly_page_stop_button_works(self):
+        cookie, csrf = self.start_control()
+        self.new_proposal()
+        status, body, _ = self.form(
+            "/control/approve", {"id": "deadbeef", "csrf": "0" * 32},
+            self.browser_headers({**cookie, "Origin": "https://evil.example"}),
+        )
+        self.assertEqual(status, 403)
+        parsed = RenderedPage()
+        parsed.feed(body.decode("utf-8"))
+        stop_form = [
+            form for form in parsed.forms
+            if str(form["attrs"].get("action", "")).endswith("/control/stop")
+        ]
+        self.assertEqual(len(stop_form), 1)
+        fields = {
+            item["name"]: item.get("value", "")
+            for item in stop_form[0]["inputs"] if item.get("name")
+        }
+        status, _, _ = self.form(
+            "/control/stop", fields,
+            {**cookie, "X-Remote-User-Name": "alice"},
+        )
+        self.assertEqual(status, 303)
+        self.assertFalse(self.server.control_active)
+        self.assertEqual(self.server.approvals.pending(), [])
+
+    def test_api_clients_still_get_json_forbidden(self):
+        cookie, csrf = self.start_control()
+        status, body, headers = self.form(
+            "/control/approve", {"id": "deadbeef", "csrf": "0" * 32},
+            {**cookie, "Origin": "https://evil.example"},
+        )
+        self.assertEqual(status, 403)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(json.loads(body), {"error": "forbidden"})
+
+    # ---------- 0.3.31: floating windows ----------
+
+    def set_windows(self, dump):
+        os.environ["FAKE_ADB_WINDOWS"] = dump
+
+    def test_window_parser_keeps_only_safe_fields(self):
+        windows = control_actions.parse_windows(WINDOWS_YOUTUBE_PIP)
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(
+            windows[0]["package"], "com.google.android.youtube"
+        )
+        self.assertEqual(windows[0]["frame"], [400, 700, 700, 860])
+        self.assertEqual(windows[2]["type"], "STATUS_BAR")
+        self.assertEqual(
+            set(windows[0]), {"package", "type", "frame", "on_screen"}
+        )
+
+    def test_floating_window_names_the_app_and_warns(self):
+        window = control_actions.find_floating_window(
+            WINDOWS_YOUTUBE_PIP, 540, 780, 1920, 1200
+        )
+        self.assertEqual(window["name"], "YouTube floating window")
+        self.assertEqual(
+            window["warning"],
+            "A floating window covers this point - the tap will hit it",
+        )
+        self.assertIsNone(
+            control_actions.find_floating_window(
+                WINDOWS_NO_FLOAT, 540, 780, 1920, 1200
+            )
+        )
+
+    def test_split_screen_pane_is_not_called_floating(self):
+        split = (
+            "  Window #0 Window{aaa u0 com.android.settings/com.android.settings.Settings}:\n"
+            "    mAttrs={(0,0)(fillxfill) ty=APPLICATION}\n"
+            "    mFrame=[0,0][1920,600]\n"
+            "    isOnScreen=true\n"
+        )
+        self.assertIsNone(
+            control_actions.find_floating_window(
+                split, 540, 300, 1920, 1200, "com.google.android.youtube"
+            )
+        )
+
+    def test_hidden_floating_window_is_ignored(self):
+        hidden = WINDOWS_YOUTUBE_PIP.replace(
+            "mFrame=[400,700][700,860]\n    isOnScreen=true",
+            "mFrame=[400,700][700,860]\n    isOnScreen=false",
+        )
+        self.assertIsNone(
+            control_actions.find_floating_window(
+                hidden, 540, 780, 1920, 1200
+            )
+        )
+
+    def test_tap_proposal_names_the_floating_window(self):
+        self.start_control()
+        self.set_windows(WINDOWS_YOUTUBE_PIP)
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "press Settings"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["tap_target"], "YouTube floating window")
+        self.assertEqual(summary["floating_window"], "YouTube floating window")
+        self.assertFalse(summary["tap_target_clickable"])
+        self.assertEqual(
+            summary["floating_window_warning"],
+            "A floating window covers this point - the tap will hit it",
+        )
+        self.assertIn("Living Room TV", summary["underlying_target"])
+        self.assertIn("Deal with it", summary["next"])
+
+    def test_tap_proposal_reports_no_floating_window(self):
+        self.start_control()
+        self.set_windows(WINDOWS_NO_FLOAT)
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "press Settings"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["floating_window"], "")
+        self.assertIn("Living Room TV", summary["tap_target"])
+
+    def test_card_names_the_floating_window_and_warns_in_red(self):
+        cookie, csrf = self.start_control()
+        self.set_windows(WINDOWS_YOUTUBE_PIP)
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "press Settings"}
+        )
+        key = json.loads(payload["result"]["content"][0]["text"])["approval_id"]
+        status, page, _ = self.req("GET", "/control", cookie)
+        self.assertEqual(status, 200)
+        html_page = page.decode("utf-8")
+        self.assertIn("This will tap: YouTube floating window", html_page)
+        self.assertIn(
+            "color:#ff2020", html_page
+        )
+        self.assertIn(
+            "A floating window covers this point - the tap will hit it",
+            html_page,
+        )
+        self.assertNotIn("Living Room TV</p>", html_page)
+        self.assertIn(key, html_page)
+
+    def test_approval_refuses_when_the_floating_window_closed(self):
+        cookie, csrf = self.start_control()
+        self.set_windows(WINDOWS_YOUTUBE_PIP)
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "press Settings"}
+        )
+        key = json.loads(payload["result"]["content"][0]["text"])["approval_id"]
+        self.set_windows(WINDOWS_NO_FLOAT)
+        status, _, headers = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("flash=floating_window", headers["Location"])
+        self.assertNotIn("'input'", self.adb_log())
+        record = self.server.approvals.get(key)
+        self.assertEqual(record["state"], "failed")
+        self.assertEqual(record["detail"], "floating_window_gone")
+
+    def test_approval_refuses_when_a_floating_window_appears(self):
+        cookie, csrf = self.start_control()
+        self.set_windows(WINDOWS_NO_FLOAT)
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "press Settings"}
+        )
+        key = json.loads(payload["result"]["content"][0]["text"])["approval_id"]
+        self.set_windows(WINDOWS_YOUTUBE_PIP)
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertNotIn("'input'", self.adb_log())
+        record = self.server.approvals.get(key)
+        self.assertEqual(record["detail"], "floating_window")
+
+    def test_approval_proceeds_when_the_same_floating_window_remains(self):
+        cookie, csrf = self.start_control()
+        self.set_windows(WINDOWS_YOUTUBE_PIP)
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "press the video"}
+        )
+        key = json.loads(payload["result"]["content"][0]["text"])["approval_id"]
+        status, _, _ = self.ctl("/control/approve", {"id": key}, cookie, csrf)
+        self.assertEqual(status, 303)
+        self.assertIn("'input'", self.adb_log())
+
+    def test_unreadable_window_dump_is_reported_unchecked(self):
+        self.start_control()
+        self.set_windows("fail")
+        self.server.last_proposal_at = 0.0
+        _, payload = self.propose(
+            "android_tap", {"x": 540, "y": 780, "reason": "press Settings"}
+        )
+        summary = json.loads(payload["result"]["content"][0]["text"])
+        self.assertEqual(summary["state"], "pending")
+        self.assertFalse(summary["floating_checked"])
+        self.assertIn("Living Room TV", summary["tap_target"])
 
 
 if __name__ == "__main__":

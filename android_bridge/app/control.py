@@ -668,6 +668,154 @@ def targets_match(proposed, current):
     )
 
 
+# Floating and overlay windows (0.3.31). A UI dump only contains the app's own
+# view hierarchy, so picture-in-picture and overlay windows are invisible to
+# describe_target(): the hit test reports the element underneath while the tap
+# would really land on the floating window. `dumpsys window windows` is
+# read-only and lists every window with its type and frame, which is enough to
+# name the window that will receive the touch.
+FLOATING_WARNING = "A floating window covers this point - the tap will hit it"
+_WINDOW_HEAD_RE = re.compile(
+    r"^\s*Window #\d+\s+Window\{[0-9a-fA-F]*\s+u\d+\s+([^}\s]+)"
+)
+_WINDOW_FRAME_RE = re.compile(
+    r"\b(?:mFrame|mBounds|mSurfaceBounds)=\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]"
+    r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]"
+)
+_WINDOW_TYPE_RE = re.compile(r"\bty=([A-Z_]+)")
+_WINDOW_PACKAGE_RE = re.compile(
+    r"\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+\Z"
+)
+# Types that are always drawn above the app and are never the app's own
+# window. System bars, the IME and the wallpaper are excluded: they belong to
+# the system and would only add noise.
+_OVERLAY_WINDOW_TYPES = frozenset({
+    "APPLICATION_PIP",
+    "APPLICATION_OVERLAY",
+    "APPLICATION_ATTACHED_DIALOG",
+    "APPLICATION_SUB_PANEL",
+    "APPLICATION_ACCESSIBILITY_OVERLAY",
+})
+_SYSTEM_WINDOW_TYPES = frozenset({
+    "STATUS_BAR", "NAVIGATION_BAR", "INPUT_METHOD", "INPUT_METHOD_DIALOG",
+    "NOTIFICATION_SHADE", "WALLPAPER", "TOAST", "SYSTEM_ERROR",
+    "BOOT_PROGRESS", "VOLUME_OVERLAY", "MAGNIFICATION_OVERLAY", "SCREENSHOT",
+    "DOCK_DIVIDER", "NAVIGATION_BAR_PANEL", "STATUS_BAR_PANEL",
+})
+# An application window must be inset by at least this fraction in both
+# directions before it is called floating, so split-screen panes (full width
+# or full height) are not reported as floating windows.
+_FLOAT_MAX_SPAN_FRACTION = 0.90
+
+
+def parse_windows(text):
+    """Window records from a `dumpsys window windows` dump.
+
+    Each record keeps only the package, window type, frame and whether the
+    window is on screen. Everything else in the dump is discarded.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    blocks = []
+    current = None
+    for line in text.splitlines():
+        if _WINDOW_HEAD_RE.match(line):
+            if current is not None:
+                blocks.append(current)
+            current = {"head": line, "lines": []}
+        elif current is not None:
+            current["lines"].append(line)
+    if current is not None:
+        blocks.append(current)
+
+    windows = []
+    for block in blocks:
+        head = _WINDOW_HEAD_RE.match(block["head"])
+        if head is None:
+            continue
+        package = head.group(1).split("/", 1)[0]
+        if not _WINDOW_PACKAGE_RE.match(package):
+            package = ""
+        body = "\n".join(block["lines"])
+        frame = _WINDOW_FRAME_RE.search(body)
+        bounds = None
+        if frame is not None:
+            bounds = [int(frame.group(index)) for index in (1, 2, 3, 4)]
+            if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                bounds = None
+        kind = _WINDOW_TYPE_RE.search(body)
+        windows.append({
+            "package": package,
+            "type": kind.group(1) if kind else "",
+            "frame": bounds,
+            "on_screen": (
+                "isOnScreen=false" not in body
+                and "mHasSurface=false" not in body
+            ),
+        })
+    return windows
+
+
+def _window_covers(frame, x, y):
+    return frame[0] <= x < frame[2] and frame[1] <= y < frame[3]
+
+
+def find_floating_window(text, x, y, width, height, foreground_package=""):
+    """Name the floating or overlay window that would receive a tap.
+
+    Returns None when nothing floating covers the point. Picture-in-picture,
+    overlay and attached-dialog windows always count; a plain application
+    window counts only when it is inset in both directions, so split-screen
+    panes and the app already in front are not misreported.
+    """
+    try:
+        x = int(x)
+        y = int(y)
+        width = int(width)
+        height = int(height)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+
+    for window in parse_windows(text):
+        if not window["on_screen"]:
+            continue
+        frame = window["frame"]
+        if frame is None or not _window_covers(frame, x, y):
+            continue
+        kind = window["type"]
+        package = window["package"]
+        if kind in _SYSTEM_WINDOW_TYPES:
+            continue
+        if package == "com.android.systemui":
+            continue
+        floating = kind in _OVERLAY_WINDOW_TYPES
+        if not floating and kind in ("", "APPLICATION"):
+            span_x = frame[2] - frame[0]
+            span_y = frame[3] - frame[1]
+            if (
+                package
+                and package != (foreground_package or "")
+                and span_x < width * _FLOAT_MAX_SPAN_FRACTION
+                and span_y < height * _FLOAT_MAX_SPAN_FRACTION
+            ):
+                floating = True
+        if not floating:
+            continue
+        label = app_label(package)
+        name = "%s floating window" % label if label else "A floating window"
+        return {
+            "name": name,
+            "package": package,
+            "bounds": list(frame),
+            "type": kind,
+            "warning": FLOATING_WARNING,
+            "description": name,
+        }
+    return None
+
+
 def list_clickable(xml_text, limit=MAX_UI_ELEMENTS):
     """Visible clickable elements for target selection. Bounded and safe."""
     elements = []

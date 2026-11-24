@@ -1,5 +1,65 @@
 # Android Bridge changelog
 
+## 0.3.31
+
+- **Control pages opened from a Home Assistant notification now work.** Cause:
+  the UI session's origin binding was taken only from the `Origin` header of
+  the sign-in POST. A notification opens the panel through the Home Assistant
+  app, where that POST arrives from an opaque context (`Origin: null`, no
+  `Sec-Fetch-Site`), so the session was stored with `origin = None`. The same
+  page then sent a real `Origin` on `POST /control/approve`, `_origin_error()`
+  had nothing to compare it with, and it refused with
+  `control_forbidden reason=origin_unbound`. The sidebar path signs in from a
+  normal https document, so its `Origin` was bound and it kept working.
+  - Sign-in now binds the origin from the `Origin` header, or, when that is
+    opaque or absent, from a `Referer` whose **path starts with the validated
+    ingress prefix** (`/api/hassio_ingress/<token>`). That prefix only exists
+    in a URL actually served through the ingress, so a foreign page cannot
+    supply it, and `Sec-Fetch-Site: cross-site` still refuses the sign-in.
+  - A session that is still unbound (created by an older build, or where the
+    browser sent no usable header at sign-in) binds **once** on its first
+    approval POST under the same conditions: ingress peer, `Sec-Fetch-Site`
+    missing or `same-origin`, and an ingress-prefixed `Referer` naming the
+    presented origin. It is logged as `origin_bound source=referer`.
+  - The CSRF token, the single-use login nonce, the ingress peer anchor and
+    the allowed-HA-user check are unchanged; the token is still required on
+    every approval, and no request may bind an origin it cannot corroborate.
+- **STOP always works.** A signed-in, still-allowed Home Assistant user coming
+  through the ingress peer can press STOP from an out-of-date page or with a
+  mismatched origin: the HA user header set by the ingress proxy is trusted,
+  or, when only the session cookie survives, the session's recorded user. STOP
+  only removes access, so CSRF and origin are deliberately not consulted on
+  that one path. Everything that grants or uses access keeps its full checks,
+  and a test asserts that a mismatched-origin approval is still refused.
+- **Friendly out-of-date page.** A browser that is refused a control action
+  now gets an HTML page (still HTTP 403) saying "This page is out of date.
+  Please reload it and try again.", with a link back to the control page and a
+  working STOP button. API, MCP and other non-browser clients still receive
+  the JSON `{"error":"forbidden"}`.
+- **Floating windows are named instead of the element underneath.** The UI
+  dump only contains the app's own view hierarchy, so a picture-in-picture or
+  overlay window was invisible: the card said "Settings" while the tap would
+  have hit the video. `dumpsys window windows` (read-only) is now parsed for
+  window package, type, frame and visibility. When a floating or overlay
+  window covers the tap point the approval card names it (for example
+  "YouTube floating window"), shows the red warning "A floating window covers
+  this point - the tap will hit it", and the `android_tap` result reports
+  `floating_window`, `floating_window_warning`, `underlying_target` and
+  `floating_checked`. Split-screen panes and the app already in front are not
+  reported, and an unreadable dump is reported as `floating_checked: false`
+  rather than as a clear point. At approval the check runs again: if a
+  floating window appeared, moved or closed, the approval fails with detail
+  `floating_window` / `floating_window_gone` and nothing is sent; if the same
+  window is still there, the already-warned tap proceeds.
+- New tests cover all four: notification sign-in binding (and refusal of a
+  cross-site or foreign Referer, and of a non-ingress peer), STOP from a
+  mismatched origin, without CSRF, from a foreign peer and from a disallowed
+  user, the friendly page's text, link and STOP form, and floating-window
+  parsing, card naming, proposal reporting, and approval-time refusal. The
+  Dockerfile test still passes.
+- Version metadata, the application `VERSION` constant, MCP
+  `serverInfo.version` and `config.yaml` all report 0.3.31.
+
 ## 0.3.30
 
 - `android_action_result` takes an optional `wait_seconds` (0-240, default 0).

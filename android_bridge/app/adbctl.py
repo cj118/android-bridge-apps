@@ -26,6 +26,8 @@ UI_DUMP_MAX_BYTES = 2 * 1024 * 1024
 UI_DUMP_PATH = "/sdcard/window_dump.xml"
 FOREGROUND_TIMEOUT = 8.0
 FOREGROUND_MAX_BYTES = 1024 * 1024
+WINDOW_TIMEOUT = 8.0
+WINDOW_MAX_BYTES = 2 * 1024 * 1024
 _SERVER_LOCK = threading.Lock()
 _server_ready = False
 
@@ -458,6 +460,24 @@ def foreground_package(serial: str, timeout: float = FOREGROUND_TIMEOUT) -> str:
     if returncode != 0:
         raise AdbError("foreground unavailable")
     return parse_foreground_package(out)
+
+
+def window_dump(serial: str, timeout: float = WINDOW_TIMEOUT) -> str:
+    """Read-only window list, for floating/overlay detection.
+
+    Fixed `dumpsys window windows`; no caller-supplied arguments. Only the
+    window records are used, and nothing from the dump is logged.
+    """
+    serial = _serial(serial)
+    ensure_server()
+    returncode, out, _err = _run(
+        ["-s", serial, "shell", "dumpsys", "window", "windows"],
+        timeout=timeout,
+        max_bytes=WINDOW_MAX_BYTES,
+    )
+    if returncode != 0 or not out:
+        raise AdbError("window dump unavailable")
+    return out.decode("utf-8", "replace")
 
 
 def run_input(args, timeout: float = 15.0):

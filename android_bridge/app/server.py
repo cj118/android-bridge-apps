@@ -30,7 +30,7 @@ import options_bridge
 import pngcheck
 import reconnect as reconnect_module
 
-VERSION = "0.3.30"
+VERSION = "0.3.31"
 PORT = 8791
 DEFAULT_DATA_DIR = "/data"
 
@@ -113,6 +113,9 @@ _FLASH_MESSAGES = {
     # redirects and tests are unchanged; the banner is added above them.
     "approval_expired": "Approval expired - nothing was sent.",
     "approval_used": "Approval already used - nothing was sent.",
+    "floating_window": (
+        "A floating window covers the tap point - nothing was sent."
+    ),
 }
 
 # Large green/red decision buttons, 64 px tall with real space between them,
@@ -1552,6 +1555,26 @@ class Handler(BaseHTTPRequestHandler):
             return control_actions.unknown_target()
         return control_actions.describe_target(xml, x, y)
 
+    def _floating_cover(self, device, x, y, width, height,
+                        foreground_package=""):
+        """Return (window or None, checked) for the window at (x, y).
+
+        Read-only `dumpsys window windows`. A UI dump cannot see a floating
+        window, so this is what stops the card naming the element underneath
+        a picture-in-picture or overlay window. An unreadable dump is reported
+        as unchecked rather than as a clear point.
+        """
+        try:
+            dump = adbctl.window_dump(device["serial"])
+        except adbctl.AdbError:
+            return None, False
+        return (
+            control_actions.find_floating_window(
+                dump, x, y, width, height, foreground_package
+            ),
+            True,
+        )
+
     def _mcp_propose(self, name, params, message_id):
         if not self._control_open():
             self._mcp_error(message_id, "control_session_inactive")
@@ -1643,6 +1666,12 @@ class Handler(BaseHTTPRequestHandler):
                 action["target"] = self._tap_target(
                     device, action["x"], action["y"]
                 )
+                floating, checked = self._floating_cover(
+                    device, action["x"], action["y"],
+                    image.width, image.height,
+                )
+                action["floating_window"] = floating
+                action["floating_checked"] = checked
             elif action.get("type") == "swipe":
                 action["start_target"] = self._tap_target(
                     device, action["x1"], action["y1"]
@@ -1736,6 +1765,23 @@ class Handler(BaseHTTPRequestHandler):
             "expires_in_seconds": int(control_actions.APPROVAL_TTL_SECONDS),
             "next": "await human approval in the Control page, then call android_action_result",
         }
+        if action.get("type") == "tap":
+            floating = action.get("floating_window") or {}
+            summary["floating_window"] = floating.get("name", "")
+            summary["floating_checked"] = bool(
+                action.get("floating_checked", True)
+            )
+            if floating:
+                summary["tap_target"] = floating["name"]
+                summary["tap_target_clickable"] = False
+                summary["underlying_target"] = target.get("description", "")
+                summary["floating_window_package"] = floating.get("package", "")
+                summary["floating_window_bounds"] = floating.get("bounds", [])
+                summary["floating_window_warning"] = floating["warning"]
+                summary["next"] = (
+                    "A floating window covers the tap point. Deal with it "
+                    "before approving: tap it, move it, or dismiss it."
+                )
         if action.get("type") == "swipe":
             start_target = action.get("start_target") or {}
             summary.update(
@@ -1812,6 +1858,21 @@ class Handler(BaseHTTPRequestHandler):
             "orientation": record.get("orientation", ""),
             "detail": record.get("detail", ""),
         }
+        if record["action"].get("type") == "tap":
+            floating = record["action"].get("floating_window") or {}
+            payload["floating_window"] = floating.get("name", "")
+            payload["floating_checked"] = bool(
+                record["action"].get("floating_checked", True)
+            )
+            if floating:
+                payload["tap_target"] = floating["name"]
+                payload["tap_target_clickable"] = False
+                payload["underlying_target"] = target.get("description", "")
+                payload["floating_window_package"] = floating.get(
+                    "package", ""
+                )
+                payload["floating_window_bounds"] = floating.get("bounds", [])
+                payload["floating_window_warning"] = floating["warning"]
         if record["action"].get("type") == "swipe":
             start_target = record["action"].get("start_target") or {}
             payload.update(
@@ -1925,6 +1986,14 @@ class Handler(BaseHTTPRequestHandler):
                 if self._authorized(fields.get("token")):
                     self._do_stop()
                     return
+                # STOP only removes access, so a signed-in, still-allowed Home
+                # Assistant user may always press it, even from a stale page
+                # whose CSRF token or origin no longer matches. Nothing that
+                # grants or uses access is relaxed by this branch.
+                if self._stop_emergency_ok(nonce):
+                    self._browser_mode = True
+                    self._do_stop()
+                    return
                 self._control_denied("stop")
                 return
 
@@ -2005,6 +2074,23 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(session["csrf"], provided)
 
+    def _referer_origin(self):
+        """Origin of a Referer that is demonstrably an ingress page URL.
+
+        The Referer path must start with the validated ingress prefix. That
+        prefix is only present in a URL actually served through Home
+        Assistant's ingress, so a foreign page cannot supply it as its own
+        Referer. A bare Referer from another origin is never accepted.
+        """
+        raw = self.headers.get("Referer") or ""
+        prefix = self._ingress_prefix()
+        if not prefix:
+            return None
+        path = urllib.parse.urlparse(raw).path or ""
+        if path != prefix and not path.startswith(prefix + "/"):
+            return None
+        return self._normalise_origin(raw)
+
     @staticmethod
     def _normalise_origin(value):
         """Return scheme://host[:port] in lower case, or None if unusable."""
@@ -2061,13 +2147,30 @@ class Handler(BaseHTTPRequestHandler):
         session = self.server.ui_sessions.get(nonce) or {}
         bound = session.get("origin")
         if bound is None:
+            # A page opened from a Home Assistant notification signs in from
+            # an opaque context: the browser sends Origin: null for the login
+            # POST, so no origin can be bound then. The loaded page then sends
+            # a real Origin. Bind it once, but only when the browser's own
+            # Referer names the same origin, Sec-Fetch-Site is not cross-site,
+            # and the request came through the ingress peer. A foreign site
+            # cannot forge either header, so this adds no CSRF bypass.
+            if (
+                self._from_ingress()
+                and site in (None, "same-origin")
+                and self._referer_origin() == presented
+            ):
+                session["origin"] = presented
+                sys.stderr.write(
+                    "origin_bound source=referer peer=%s\n" % self._peer()
+                )
+                return None
             return "origin_unbound"
         if presented != bound:
             return "origin_mismatch"
         return None
 
-    def _send_html_with(self, body, headers=None):
-        self.send_response(200)
+    def _send_html_with(self, body, headers=None, status=200):
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -2166,6 +2269,12 @@ class Handler(BaseHTTPRequestHandler):
         if bound_origin is not None and site is not None and site != "same-origin":
             self._login_denied("sfs_not_same_origin")
             return
+        # Notification pages sign in from an opaque context (Origin: null), so
+        # the Origin header alone cannot bind the session. The Referer of the
+        # same navigation still names the real page origin; bind that so the
+        # page's later approval posts have something to match.
+        if bound_origin is None and site in (None, "same-origin"):
+            bound_origin = self._referer_origin()
 
         prefix = self._ingress_prefix()
         if prefix is None:
@@ -2206,8 +2315,8 @@ class Handler(BaseHTTPRequestHandler):
     def _safe_text(value):
         return "".join(ch for ch in value if ch.isalnum() or ch in "._-@ ")[:64]
 
-    def _send_html_with(self, body, headers=None):
-        self.send_response(200)
+    def _send_html_with(self, body, headers=None, status=200):
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -2358,6 +2467,50 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
 
+    def _wants_html(self):
+        """Browsers ask for HTML; API clients and the MCP path do not."""
+        accept = self.headers.get("Accept") or ""
+        return "text/html" in accept.lower()
+
+    def _control_url(self, suffix=""):
+        """Absolute control URL, including the validated ingress prefix."""
+        prefix = self._ingress_prefix()
+        if not prefix:
+            return "/control" + suffix
+        return prefix + "/control" + suffix
+
+    def _stale_page(self):
+        """Human-readable out-of-date page, with a working STOP button."""
+        nonce = self._ui_session()
+        session = (self.server.ui_sessions.get(nonce) or {}) if nonce else {}
+        csrf = session.get("csrf", "")
+        csrf_field = (
+            "<input type='hidden' name='csrf' value='%s'>"
+            % html.escape(csrf, quote=True)
+            if csrf
+            else ""
+        )
+        link = html.escape(self._control_url(), quote=True)
+        action = html.escape(self._control_url("/stop"), quote=True)
+        body = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Android Bridge - page out of date</title>%s</head>"
+            "<body style='font-family:system-ui;max-width:34rem;"
+            "margin:2rem auto;padding:0 1rem'>"
+            "<h1>This page is out of date</h1>"
+            "<p style='font-size:1.25rem'>This page is out of date. Please "
+            "reload it and try again.</p>"
+            "<p><a href='%s'>Reload the control page</a></p>"
+            "<form method='post' action='%s' style='margin-top:1.5rem'>"
+            "%s<button style='background:#a00;color:#fff;padding:.9rem 2.5rem;"
+            "font-size:1.25rem;font-weight:700;border:0;border-radius:10px'>"
+            "STOP</button></form>"
+            "<p style='color:#a00'>STOP cannot undo a tap already sent.</p>"
+            "</body></html>"
+        ) % (_CONTROL_CSS, link, action, csrf_field)
+        return body.encode("utf-8")
+
     def _control_denied(self, reason):
         """Log which guard rejected the request. Header names only, no values."""
         sys.stderr.write(
@@ -2370,6 +2523,9 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
         time.sleep(AUTH_FAIL_DELAY_SECONDS)
+        if self._wants_html():
+            self._send_html_with(self._stale_page(), status=403)
+            return
         self._send_json(403, {"error": "forbidden"})
 
     def _login_denied(self, reason, user=None):
@@ -2385,6 +2541,28 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write(line + "\n")
         time.sleep(AUTH_FAIL_DELAY_SECONDS)
         self._send_json(403, {"error": "forbidden"})
+
+    def _stop_emergency_ok(self, nonce):
+        """Always allow STOP for a signed-in, allowed HA user via ingress.
+
+        The ingress peer anchor proves the request came through Home
+        Assistant's own proxy, and X-Remote-User-Name is set by that proxy
+        only after it has authenticated the user. A stale page may keep only
+        its session cookie, so the session's recorded user is accepted too.
+        The CSRF token and origin binding are deliberately not consulted:
+        STOP can only remove access, never grant or use it.
+        """
+        if not self._from_ingress():
+            return False
+        user = (self.headers.get("X-Remote-User-Name") or "").strip()
+        if user:
+            return user in self.server.allowed_users
+        session = self.server.ui_sessions.get(nonce) if nonce else None
+        if not session:
+            return False
+        if session.get("expires", 0.0) <= time.monotonic():
+            return False
+        return session.get("user") in self.server.allowed_users
 
     def _do_stop(self):
         with self.server.control_lock:
@@ -2672,6 +2850,43 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
 
+                if action_type == "tap":
+                    # The hit test cannot see a floating window, and one can
+                    # appear between the proposal and the approval. An
+                    # unreadable dump counts as changed whenever a floating
+                    # window was named.
+                    proposed_float = (
+                        record["action"].get("floating_window") or {}
+                    )
+                    current_float, _checked = self._floating_cover(
+                        device, x, y,
+                        int(record.get("width", 0)),
+                        int(record.get("height", 0)),
+                    )
+
+                    def _float_signature(window):
+                        if not window:
+                            return None
+                        return (
+                            window.get("name", ""),
+                            window.get("package", ""),
+                            tuple(window.get("bounds") or ()),
+                        )
+
+                    if _float_signature(proposed_float) != _float_signature(
+                        current_float
+                    ):
+                        detail = (
+                            "floating_window" if current_float
+                            else "floating_window_gone"
+                        )
+                        self.server.approvals.fail(key, detail)
+                        self._respond(
+                            {"error": "floating_window"}, 409,
+                            flash="floating_window",
+                        )
+                        return
+
             try:
                 record = self.server.approvals.approve(key)
             except control_actions.ActionError as exc:
@@ -2804,6 +3019,16 @@ class Handler(BaseHTTPRequestHandler):
                 return "Failed — App changed — ask again."
             if detail == "sensitive_field":
                 return "Failed — Sensitive field — typing refused."
+            if detail == "floating_window":
+                return (
+                    "Failed — A floating window covers the tap point — "
+                    "ask again."
+                )
+            if detail == "floating_window_gone":
+                return (
+                    "Failed — The floating window moved or closed — "
+                    "ask again."
+                )
             return "Failed"
         return state.replace("_", " ").title()
 
@@ -3087,6 +3312,12 @@ class Handler(BaseHTTPRequestHandler):
                 "<div class='banner banner-bad'>"
                 "✗ Approval already used - nothing was sent</div>"
             )
+        if flash == "floating_window":
+            return (
+                "<div class='banner banner-bad'>"
+                "✗ A floating window covers the tap point - nothing was "
+                "sent</div>"
+            )
         return ""
 
     def _control_page(self, nonce, flash=""):
@@ -3143,16 +3374,33 @@ class Handler(BaseHTTPRequestHandler):
                 x = int(action.get("x", 0))
                 y = int(action.get("y", 0))
                 target = action.get("target") or {}
-                target_text = html.escape(
-                    str(target.get("description") or control_actions.UNKNOWN_TARGET),
-                    quote=True,
-                )
+                floating = action.get("floating_window") or {}
+                if floating:
+                    # The hit test only sees the app's own view hierarchy, so
+                    # the floating window that will really receive the tap is
+                    # named instead of the element drawn underneath it.
+                    target_text = html.escape(
+                        str(floating.get("name") or "A floating window"),
+                        quote=True,
+                    )
+                else:
+                    target_text = html.escape(
+                        str(
+                            target.get("description")
+                            or control_actions.UNKNOWN_TARGET
+                        ),
+                        quote=True,
+                    )
                 headline = (
                     "<p style='font-size:1.7rem;font-weight:700;"
                     "line-height:1.3;margin:0 0 .75rem'>"
                     "This will tap: %s</p>" % target_text
                 )
-                if target.get("clickable"):
+                if floating:
+                    warning = floating.get("warning") or (
+                        control_actions.FLOATING_WARNING
+                    )
+                elif target.get("clickable"):
                     warning = "Warning: this will press a button"
                 else:
                     warning = (
